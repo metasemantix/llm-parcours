@@ -48,7 +48,7 @@ This is the baseline: the tested agent receives exact ZERO, ONE, and READ URLs a
 
 ### Circular Trail
 
-Create a run at `/binary-trail/new`. A human may inspect its DEBUG page and arm it; the default agent prompt contains neither DEBUG nor ARM. The agent receives only `/binary-trail/:run/entry`. Entry and every successful write page expose ordinary server-rendered ZERO, ONE, and READ links for the current next step. There are no forms, scripts, redirects, cookies, client state, URL construction, or Back requirement in the agent flow.
+Create a run at `/binary-trail/new`. While it remains `created`, its entry page returns `run_not_armed` and contains no ZERO, ONE, or READ action links. The human must visit DEBUG and arm the run first, and only then give the entry URL and suggested prompt to the tested agent. The default agent prompt contains neither DEBUG nor ARM. Once armed, `/binary-trail/:run/entry` exposes the first fresh ordinary server-rendered ZERO, ONE, and READ links; every successful write page exposes links for the next step. There are no forms, scripts, redirects, cookies, client state, URL construction, or Back requirement in the agent flow.
 
 Each step has three server-issued random suffixes. A ZERO or ONE succeeds only when its step equals the run's current `next_step` and its suffix is the issued token for that action. The transactional batch atomically appends the bit, advances exactly one step, rotates all three successor tokens, and inserts the authoritative write event. The unique successful-step index and conditional update prevent concurrent or later reuse. Replaying any old or mismatched step/token returns HTTP 409 with `trail_step_already_used`, appends nothing, records a distinct replay event, and exposes the currently valid successor links. Before arming, a valid action records `pre_arm_request` without consuming the step or changing bits.
 
@@ -69,7 +69,7 @@ Use a fresh run for every row and record conceptual understanding, attempted nav
 | Condition | Sequences | URL protocol |
 | --- | --- | --- |
 | Static baseline | `1`, `101`, `00000`, `01010101` | Supply the three fixed URLs. |
-| Circular Trail | `1`, `101`, `00000`, `01010101`, `01000001` | Supply entry only; require links from each page. |
+| Circular Trail | `1`, `101`, `00000`, `01010101`, `01000001` | Arm from DEBUG first, then supply entry only and require links from each page. |
 | Alias, explicit/verbatim | `00000`, `11111`, `01010101` | Supply enough complete aliases. |
 | Alias, template negative control | chosen repeats | Supply a template rule; record understanding separately from actual navigation. |
 

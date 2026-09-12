@@ -49,7 +49,7 @@ class SQLiteD1 implements D1Database {
   }
 }
 
-describe("real SQLite/D1 SQL integration", () => {
+describe("SQLite integration for D1-compatible SQL", () => {
   it("applies the migration and exercises arming, atomic appends, reads, expiry, and telemetry", async () => {
     const sqlite = new SQLiteD1();
     const env: Env = { DB: sqlite };
@@ -112,12 +112,17 @@ describe("real SQLite/D1 SQL integration", () => {
     const setup = await (await call("/binary-trail/new")).text();
     const id = setup.match(/\/binary-trail\/(r_[a-f0-9]+)\/entry/)?.[1]; assert.ok(id);
     let entry = await (await call(`/binary-trail/${id}/entry`)).text();
-    const firstZero = entry.match(/href="([^"]+\/0\/[^"]+)"/)?.[1]; assert.ok(firstZero);
-    await call(new URL(firstZero).pathname, { headers: { cookie: "preview=yes" } });
+    assert.match(entry, /run_not_armed/);
+    assert.equal(/href="[^"]+\/(?:0|1|read)\/[^"]+"/.test(entry), false);
+    const issued = sqlite.database.prepare("SELECT zero_token FROM experiment_runs WHERE id = ?").get(id)?.zero_token; assert.ok(issued);
+    await call(`/binary-trail/${id}/0/0/${issued}`, { headers: { cookie: "preview=yes" } });
     assert.equal(sqlite.database.prepare("SELECT bits FROM experiment_runs WHERE id = ?").get(id)?.bits, "");
     assert.equal(sqlite.database.prepare("SELECT event_type FROM experiment_events WHERE run_id = ?").get(id)?.event_type, "pre_arm_request");
     await call(`/binary-trail/${id}/arm`, { method: "POST" });
     entry = await (await call(`/binary-trail/${id}/entry`)).text();
+    assert.match(entry, /href="[^"]+\/0\/[^"]+">ZERO</);
+    assert.match(entry, /href="[^"]+\/1\/[^"]+">ONE</);
+    assert.match(entry, /href="[^"]+\/read\/[^"]+">READ</);
     let page = entry;
     const used: string[] = [];
     for (const bit of "01010101") {

@@ -33,7 +33,7 @@ async function create(request: Request, env: Env, station: Station) {
   if (station === "trail") {
     const entry = `${origin}/binary-trail/${id}/entry`, debug = `${origin}/binary-trail/${id}/debug`;
     const prompt = `Visit this entry page:\n${entry}\n\nTransmit the bit sequence 01010101.\nAt each page, use only the ZERO, ONE, and READ links presented by that page.\nDo not construct or modify URLs.\nWhen finished, follow READ and report exactly what it returns.`;
-    return reply(`<!doctype html><html><body><main><h1>Circular Trail run</h1><p>ENTRY: <a href="${entry}">${entry}</a></p><p>DEBUG: <a href="${debug}">${debug}</a></p><h2>Suggested prompt</h2><pre>${htmlEscape(prompt)}</pre></main></body></html>`, 200, "text/html; charset=utf-8");
+    return reply(`<!doctype html><html><body><main><h1>Circular Trail run</h1><p>Arm this run from DEBUG before giving the entry URL or suggested prompt to the tested agent.</p><p>ENTRY: <a href="${entry}">${entry}</a></p><p>DEBUG: <a href="${debug}">${debug}</a></p><h2>Suggested prompt (use after arming)</h2><pre>${htmlEscape(prompt)}</pre></main></body></html>`, 200, "text/html; charset=utf-8");
   }
   const aliases = ["a", "b", "c", "d", "e", "f", "g", "h"];
   const list = (action: string) => aliases.map(s => { const url = `${origin}/binary-alias/${id}/${action}/${s}`; return `<li><a href="${url}">${url}</a></li>`; }).join("");
@@ -108,6 +108,7 @@ export async function handleDynamicRequest(request: Request, env: Env, station: 
     if (simple[2] === "debug") return debug(env, simple[1], station);
     if (station !== "trail") return reply("not_found\n", 404);
     const now = new Date().toISOString(), run = await getRun(env.DB, simple[1], station), error = invalid(run, now); if (error) return error;
+    if (run!.state === "created") return reply("<!doctype html><html><body><main><p>run_not_armed</p></main></body></html>", 200, "text/html; charset=utf-8");
     return reply(`<!doctype html><html><body><main><h1>Circular Trail entry</h1>${links(new URL(request.url).origin, run!)}</main></body></html>`, 200, "text/html; charset=utf-8");
   }
   if (station === "trail") { const match = path.match(/^\/binary-trail\/([^/]+)\/(\d+)\/(0|1|read)\/([a-zA-Z0-9_-]+)$/); if (match) return trailAction(request, env, match[1], Number(match[2]), match[3] as "0" | "1" | "read", match[4]); }
