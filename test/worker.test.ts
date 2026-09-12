@@ -10,6 +10,8 @@ class FakeStatement {
   private db: FakeD1;
   private sql: string;
   constructor(db: FakeD1, sql: string) { this.db = db; this.sql = sql; }
+  get query() { return this.sql; }
+  get bindings() { return this.values; }
   bind(...values: unknown[]) { this.values = values; return this; }
   async first<T>(): Promise<T | null> {
     if (this.sql.startsWith("SELECT id, bits")) return (this.db.runs.get(String(this.values[0])) ?? null) as T | null;
@@ -52,7 +54,37 @@ class FakeD1 {
   runs = new Map<string, Run>();
   events: Event[] = [];
   eventId = 0;
+  failNextWriteEvent = false;
   prepare(sql: string) { return new FakeStatement(this, sql); }
+  async batch<T>(statements: D1PreparedStatement[]): Promise<D1Result<T>[]> {
+    const runs = new Map([...this.runs].map(([id, run]) => [id, { ...run }]));
+    const events = this.events.map((event) => ({ ...event }));
+    const eventId = this.eventId;
+    try {
+      const [update, insert] = statements as FakeStatement[];
+      const [bit, id, now] = update.bindings.map(String);
+      const run = this.runs.get(id);
+      if (run && run.expires_at > now && run.state === "armed") run.bits += bit;
+      if (this.failNextWriteEvent) {
+        this.failNextWriteEvent = false;
+        throw new Error("simulated telemetry failure");
+      }
+      const [eventBit, path, userAgent, createdAt, eventRunId, eventNow] = insert.bindings;
+      const eventRun = this.runs.get(String(eventRunId));
+      const results: { sequence_number: number }[] = [];
+      if (eventRun && eventRun.expires_at > String(eventNow) && eventRun.state === "armed") {
+        const sequence_number = eventRun.bits.length;
+        this.events.push({ id: ++this.eventId, run_id: eventRun.id, event_type: "write", bit: Number(eventBit), sequence_number, observed_length: null, request_path: String(path), user_agent: userAgent as string | null, created_at: String(createdAt) });
+        results.push({ sequence_number });
+      }
+      return [{ success: true, results: [], meta: {} }, { success: true, results, meta: {} }] as D1Result<T>[];
+    } catch (error) {
+      this.runs = runs;
+      this.events = events;
+      this.eventId = eventId;
+      throw error;
+    }
+  }
 }
 
 describe("Static Binary Channel Worker", () => {
@@ -132,6 +164,15 @@ describe("Static Binary Channel Worker", () => {
     await call(`/binary/${id}/1`);
     await readValue(id);
     assert.equal(db.events.at(-1)?.observed_length, 1);
+  });
+
+  it("rolls back an append when write telemetry fails", async () => {
+    const id = await create();
+    db.failNextWriteEvent = true;
+    const response = await call(`/binary/${id}/1`);
+    assert.equal(response.status, 500);
+    assert.equal(db.runs.get(id)?.bits, "");
+    assert.equal(db.events.length, 0);
   });
 
   it("debug shows bits and chronological event history", async () => {

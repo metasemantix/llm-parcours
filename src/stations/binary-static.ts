@@ -76,18 +76,20 @@ async function writeBit(request: Request, env: Env, id: string, bit: "0" | "1"):
     return response(`run_not_armed\nrequested:${bit}\n`);
   }
 
-  // The append itself is one conditional SQL update; no application-side read/append/write occurs.
-  const updated = await env.DB.prepare(
-    "UPDATE binary_runs SET bits = bits || ? WHERE id = ? AND expires_at > ? AND state = 'armed' RETURNING length(bits) AS sequence_number",
-  ).bind(bit, id, now).first<{ sequence_number: number }>();
-  if (!updated) {
+  const update = env.DB.prepare(
+    "UPDATE binary_runs SET bits = bits || ? WHERE id = ? AND expires_at > ? AND state = 'armed'",
+  ).bind(bit, id, now);
+  const event = env.DB.prepare(
+    "INSERT INTO binary_events (run_id, event_type, bit, sequence_number, observed_length, request_path, user_agent, created_at) SELECT id, 'write', ?, length(bits), NULL, ?, ?, ? FROM binary_runs WHERE id = ? AND expires_at > ? AND state = 'armed' RETURNING sequence_number",
+  ).bind(Number(bit), new URL(request.url).pathname, request.headers.get("user-agent"), now, id, now);
+  // D1 batches are transactional: event failure rolls the authoritative append back.
+  const results = await env.DB.batch<{ sequence_number: number }>([update, event]);
+  const sequenceNumber = results[1]?.results[0]?.sequence_number;
+  if (sequenceNumber === undefined) {
     const current = await getRun(env.DB, id);
     return runError(current, now) ?? response("state_update_failed\n", 500);
   }
-  await env.DB.prepare(
-    "INSERT INTO binary_events (run_id, event_type, bit, sequence_number, observed_length, request_path, user_agent, created_at) VALUES (?, 'write', ?, ?, NULL, ?, ?, ?)",
-  ).bind(id, Number(bit), updated.sequence_number, new URL(request.url).pathname, request.headers.get("user-agent"), now).run();
-  return response(`recorded:${bit}\nsequence:${updated.sequence_number}\n`);
+  return response(`recorded:${bit}\nsequence:${sequenceNumber}\n`);
 }
 
 async function readRun(request: Request, env: Env, id: string): Promise<Response> {

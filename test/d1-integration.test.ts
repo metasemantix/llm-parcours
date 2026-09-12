@@ -9,6 +9,8 @@ class SQLiteStatement implements D1PreparedStatement {
   private readonly database: DatabaseSync;
   private readonly sql: string;
   constructor(database: DatabaseSync, sql: string) { this.database = database; this.sql = sql; }
+  get query() { return this.sql; }
+  get bindings() { return this.values; }
   bind(...values: unknown[]) { this.values = values; return this; }
   async first<T>(): Promise<T | null> {
     return (this.database.prepare(this.sql).get(...this.values) as T | undefined) ?? null;
@@ -29,6 +31,21 @@ class SQLiteD1 implements D1Database {
     this.database.exec(readFileSync(new URL("../migrations/0001_initial.sql", import.meta.url), "utf8"));
   }
   prepare(sql: string) { return new SQLiteStatement(this.database, sql); }
+  async batch<T>(statements: D1PreparedStatement[]): Promise<D1Result<T>[]> {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const results = (statements as SQLiteStatement[]).map((statement) => {
+        const prepared = this.database.prepare(statement.query);
+        const rows = /\bRETURNING\b/i.test(statement.query) ? prepared.all(...statement.bindings) : (prepared.run(...statement.bindings), []);
+        return { success: true, results: rows as T[], meta: {} };
+      });
+      this.database.exec("COMMIT");
+      return results;
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
 }
 
 describe("real SQLite/D1 SQL integration", () => {
@@ -72,6 +89,19 @@ describe("real SQLite/D1 SQL integration", () => {
     sqlite.database.prepare("INSERT INTO binary_runs (id, bits, state, created_at, expires_at) VALUES ('expired', '', 'armed', '2000-01-01', '2000-01-02')").run();
     assert.equal((await call("/binary/expired/1")).status, 410);
     assert.equal(sqlite.database.prepare("SELECT bits FROM binary_runs WHERE id = 'expired'").get()?.bits, "");
+
+    sqlite.database.prepare("INSERT INTO binary_runs (id, bits, state, created_at, expires_at) VALUES ('rollback', '', 'armed', '2000-01-01', '2999-01-01')").run();
+    let failed = false;
+    try {
+      await sqlite.batch([
+        sqlite.prepare("UPDATE binary_runs SET bits = bits || '1' WHERE id = 'rollback'"),
+        sqlite.prepare("INSERT INTO missing_telemetry_table VALUES (1)"),
+      ]);
+    } catch {
+      failed = true;
+    }
+    assert.equal(failed, true);
+    assert.equal(sqlite.database.prepare("SELECT bits FROM binary_runs WHERE id = 'rollback'").get()?.bits, "");
     sqlite.database.close();
   });
 });

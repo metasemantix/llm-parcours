@@ -38,7 +38,7 @@ For each run, use this sequence:
 4. Use the ordinary form on DEBUG to arm the run.
 5. Give or execute the transmission instruction, then inspect READ and DEBUG.
 
-The stored bit string and each write's returned `sequence_number` are authoritative. D1 does not provide a practical way for this Worker to feed `UPDATE … RETURNING` output into a following event insert inside one batch, so append and event insertion remain separate operations. A telemetry insert can therefore fail after a successful append, and concurrent event receipt IDs need not match write order. Successful write events retain their authoritative sequence number, and DEBUG labels receipt order separately. Read events store the length actually observed by that read so intervening writes do not make the observation ambiguous.
+The stored bit string and each write's returned `sequence_number` are authoritative. Each append and its write-event insert execute sequentially in one transactional D1 batch; the event derives its sequence from `length(bits)` after the append, and either both statements commit or both roll back. Concurrent event receipt IDs are not presented as bit positions: successful writes retain their authoritative sequence number, and DEBUG labels receipt order separately. Read events store the length actually observed by that read so intervening writes do not make the observation ambiguous.
 
 ## Local development
 
