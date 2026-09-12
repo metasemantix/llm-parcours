@@ -1,6 +1,7 @@
 CREATE TABLE binary_runs (
   id TEXT PRIMARY KEY,
   bits TEXT NOT NULL DEFAULT '',
+  state TEXT NOT NULL DEFAULT 'created' CHECK (state IN ('created', 'armed')),
   created_at TEXT NOT NULL,
   expires_at TEXT NOT NULL
 );
@@ -11,6 +12,7 @@ CREATE TABLE binary_events (
   event_type TEXT NOT NULL,
   bit INTEGER,
   sequence_number INTEGER,
+  observed_length INTEGER,
   request_path TEXT,
   user_agent TEXT,
   created_at TEXT NOT NULL,

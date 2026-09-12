@@ -2,8 +2,8 @@ import { beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import worker, { type Env } from "../src/index.ts";
 
-type Run = { id: string; bits: string; created_at: string; expires_at: string };
-type Event = { id: number; run_id: string; event_type: string; bit: number | null; sequence_number: number | null; request_path: string; user_agent: string | null; created_at: string };
+type Run = { id: string; bits: string; state: "created" | "armed"; created_at: string; expires_at: string };
+type Event = { id: number; run_id: string; event_type: string; bit: number | null; sequence_number: number | null; observed_length: number | null; request_path: string; user_agent: string | null; created_at: string };
 
 class FakeStatement {
   private values: unknown[] = [];
@@ -16,7 +16,7 @@ class FakeStatement {
     if (this.sql.startsWith("UPDATE binary_runs")) {
       const [bit, id, now] = this.values.map(String);
       const run = this.db.runs.get(id);
-      if (!run || run.expires_at <= now) return null;
+      if (!run || run.expires_at <= now || run.state !== "armed") return null;
       run.bits += bit;
       return { sequence_number: run.bits.length } as T;
     }
@@ -25,14 +25,20 @@ class FakeStatement {
   async run(): Promise<D1Result> {
     if (this.sql.startsWith("INSERT INTO binary_runs")) {
       const [id, created_at, expires_at] = this.values.map(String);
-      this.db.runs.set(id, { id, bits: "", created_at, expires_at });
+      this.db.runs.set(id, { id, bits: "", state: "created", created_at, expires_at });
     } else if (this.sql.startsWith("INSERT INTO binary_events")) {
       const isRead = this.sql.includes("'read'");
+      const isPreArm = this.sql.includes("'pre_arm_request'");
       const [run_id, ...rest] = this.values;
       const event: Event = isRead
-        ? { id: ++this.db.eventId, run_id: String(run_id), event_type: "read", bit: null, sequence_number: null, request_path: String(rest[0]), user_agent: rest[1] as string | null, created_at: String(rest[2]) }
-        : { id: ++this.db.eventId, run_id: String(run_id), event_type: "write", bit: Number(rest[0]), sequence_number: Number(rest[1]), request_path: String(rest[2]), user_agent: rest[3] as string | null, created_at: String(rest[4]) };
+        ? { id: ++this.db.eventId, run_id: String(run_id), event_type: "read", bit: null, sequence_number: null, observed_length: Number(rest[0]), request_path: String(rest[1]), user_agent: rest[2] as string | null, created_at: String(rest[3]) }
+        : isPreArm
+          ? { id: ++this.db.eventId, run_id: String(run_id), event_type: "pre_arm_request", bit: Number(rest[0]), sequence_number: null, observed_length: Number(rest[1]), request_path: String(rest[2]), user_agent: rest[3] as string | null, created_at: String(rest[4]) }
+          : { id: ++this.db.eventId, run_id: String(run_id), event_type: "write", bit: Number(rest[0]), sequence_number: Number(rest[1]), observed_length: null, request_path: String(rest[2]), user_agent: rest[3] as string | null, created_at: String(rest[4]) };
       this.db.events.push(event);
+    } else if (this.sql.startsWith("UPDATE binary_runs SET state")) {
+      const run = this.db.runs.get(String(this.values[0]));
+      if (run && run.state === "created" && run.expires_at > String(this.values[1])) run.state = "armed";
     } else throw new Error(`Unhandled run: ${this.sql}`);
     return { success: true, meta: {} } as D1Result;
   }
@@ -55,11 +61,12 @@ describe("Static Binary Channel Worker", () => {
   beforeEach(() => { db = new FakeD1(); env = { DB: db as unknown as D1Database }; });
 
   const call = (path: string, init?: RequestInit) => worker.fetch(new Request(`https://example.test${path}`, init), env);
-  async function create() {
+  async function create(arm = true) {
     const response = await call("/binary/new");
     const html = await response.text();
     const id = html.match(/\/binary\/(r_[a-f0-9]+)\/0/)?.[1];
     assert.ok(id);
+    if (arm) assert.equal((await call(`/binary/${id}/arm`, { method: "POST" })).status, 200);
     return id!;
   }
   const readValue = async (id: string) => (await (await call(`/binary/${id}/read`)).text()).match(/value:\n(.*)\nlength:/)?.[1];
@@ -97,11 +104,34 @@ describe("Static Binary Channel Worker", () => {
   });
 
   it("does not mutate expired runs", async () => {
-    db.runs.set("expired", { id: "expired", bits: "1", created_at: "2000-01-01T00:00:00.000Z", expires_at: "2000-01-02T00:00:00.000Z" });
+    db.runs.set("expired", { id: "expired", bits: "1", state: "armed", created_at: "2000-01-01T00:00:00.000Z", expires_at: "2000-01-02T00:00:00.000Z" });
     const response = await call("/binary/expired/0");
     assert.equal(response.status, 410);
     assert.equal(await response.text(), "run_expired\n");
     assert.equal(db.runs.get("expired")?.bits, "1");
+  });
+
+  it("logs pre-arm requests without mutating, then allows writes after arming", async () => {
+    const id = await create(false);
+    const createdDebug = await (await call(`/binary/${id}/debug`)).text();
+    assert.match(createdDebug, /<dt>State<\/dt><dd>created<\/dd>/);
+    assert.match(createdDebug, /<button type="submit">Arm run<\/button>/);
+    const before = await call(`/binary/${id}/1`);
+    assert.equal(await before.text(), "run_not_armed\nrequested:1\n");
+    assert.equal(db.runs.get(id)?.bits, "");
+    assert.equal(db.events[0]?.event_type, "pre_arm_request");
+    await call(`/binary/${id}/arm`, { method: "POST" });
+    await call(`/binary/${id}/1`);
+    assert.equal(db.runs.get(id)?.bits, "1");
+    const armedDebug = await (await call(`/binary/${id}/debug`)).text();
+    assert.match(armedDebug, /<dt>State<\/dt><dd>armed<\/dd>/);
+  });
+
+  it("records the length observed by each read", async () => {
+    const id = await create();
+    await call(`/binary/${id}/1`);
+    await readValue(id);
+    assert.equal(db.events.at(-1)?.observed_length, 1);
   });
 
   it("debug shows bits and chronological event history", async () => {

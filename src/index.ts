@@ -11,6 +11,9 @@ export default {
     const isExperiment = new URL(request.url).pathname.startsWith("/binary/");
     try {
       const url = new URL(request.url);
+      if (request.method === "POST" && /^\/binary\/[^/]+\/arm$/.test(url.pathname)) {
+        return await handleBinaryRequest(request, env);
+      }
       if (request.method !== "GET") return notFound();
       if (url.pathname === "/") {
         return new Response(

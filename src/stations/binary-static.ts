@@ -6,12 +6,13 @@ const NO_CACHE = {
   Expires: "0",
 };
 
-type Run = { id: string; bits: string; created_at: string; expires_at: string };
+type Run = { id: string; bits: string; state: "created" | "armed"; created_at: string; expires_at: string };
 type Event = {
   id: number;
   event_type: string;
   bit: number | null;
   sequence_number: number | null;
+  observed_length: number | null;
   request_path: string | null;
   user_agent: string | null;
   created_at: string;
@@ -36,7 +37,7 @@ function newRunId(): string {
 }
 
 async function getRun(db: D1Database, id: string): Promise<Run | null> {
-  return db.prepare("SELECT id, bits, created_at, expires_at FROM binary_runs WHERE id = ?").bind(id).first<Run>();
+  return db.prepare("SELECT id, bits, state, created_at, expires_at FROM binary_runs WHERE id = ?").bind(id).first<Run>();
 }
 
 function runError(run: Run | null, now: string): Response | null {
@@ -49,7 +50,7 @@ async function createRun(request: Request, env: Env): Promise<Response> {
   const id = newRunId();
   const created = new Date();
   const expires = new Date(created.getTime() + 24 * 60 * 60 * 1000);
-  await env.DB.prepare("INSERT INTO binary_runs (id, bits, created_at, expires_at) VALUES (?, '', ?, ?)")
+  await env.DB.prepare("INSERT INTO binary_runs (id, bits, state, created_at, expires_at) VALUES (?, '', 'created', ?, ?)")
     .bind(id, created.toISOString(), expires.toISOString())
     .run();
   const origin = new URL(request.url).origin;
@@ -68,16 +69,23 @@ async function writeBit(request: Request, env: Env, id: string, bit: "0" | "1"):
   const error = runError(run, now);
   if (error) return error;
 
+  if (run!.state === "created") {
+    await env.DB.prepare(
+      "INSERT INTO binary_events (run_id, event_type, bit, sequence_number, observed_length, request_path, user_agent, created_at) VALUES (?, 'pre_arm_request', ?, NULL, ?, ?, ?, ?)",
+    ).bind(id, Number(bit), run!.bits.length, new URL(request.url).pathname, request.headers.get("user-agent"), now).run();
+    return response(`run_not_armed\nrequested:${bit}\n`);
+  }
+
   // The append itself is one conditional SQL update; no application-side read/append/write occurs.
   const updated = await env.DB.prepare(
-    "UPDATE binary_runs SET bits = bits || ? WHERE id = ? AND expires_at > ? RETURNING length(bits) AS sequence_number",
+    "UPDATE binary_runs SET bits = bits || ? WHERE id = ? AND expires_at > ? AND state = 'armed' RETURNING length(bits) AS sequence_number",
   ).bind(bit, id, now).first<{ sequence_number: number }>();
   if (!updated) {
     const current = await getRun(env.DB, id);
     return runError(current, now) ?? response("state_update_failed\n", 500);
   }
   await env.DB.prepare(
-    "INSERT INTO binary_events (run_id, event_type, bit, sequence_number, request_path, user_agent, created_at) VALUES (?, 'write', ?, ?, ?, ?, ?)",
+    "INSERT INTO binary_events (run_id, event_type, bit, sequence_number, observed_length, request_path, user_agent, created_at) VALUES (?, 'write', ?, ?, NULL, ?, ?, ?)",
   ).bind(id, Number(bit), updated.sequence_number, new URL(request.url).pathname, request.headers.get("user-agent"), now).run();
   return response(`recorded:${bit}\nsequence:${updated.sequence_number}\n`);
 }
@@ -88,8 +96,8 @@ async function readRun(request: Request, env: Env, id: string): Promise<Response
   const error = runError(run, now);
   if (error) return error;
   await env.DB.prepare(
-    "INSERT INTO binary_events (run_id, event_type, bit, sequence_number, request_path, user_agent, created_at) VALUES (?, 'read', NULL, NULL, ?, ?, ?)",
-  ).bind(id, new URL(request.url).pathname, request.headers.get("user-agent"), now).run();
+    "INSERT INTO binary_events (run_id, event_type, bit, sequence_number, observed_length, request_path, user_agent, created_at) VALUES (?, 'read', NULL, NULL, ?, ?, ?, ?)",
+  ).bind(id, run!.bits.length, new URL(request.url).pathname, request.headers.get("user-agent"), now).run();
   return response(`value:\n${run!.bits}\nlength:\n${run!.bits.length}\n`);
 }
 
@@ -99,16 +107,30 @@ async function debugRun(env: Env, id: string): Promise<Response> {
   const error = runError(run, now);
   if (error) return error;
   const events = await env.DB.prepare(
-    "SELECT id, event_type, bit, sequence_number, request_path, user_agent, created_at FROM binary_events WHERE run_id = ? ORDER BY id ASC",
+    "SELECT id, event_type, bit, sequence_number, observed_length, request_path, user_agent, created_at FROM binary_events WHERE run_id = ? ORDER BY id ASC",
   ).bind(id).all<Event>();
-  const rows = events.results.map((event) => `<tr><td>${event.id}</td><td>${escapeHtml(event.event_type)}</td><td>${escapeHtml(event.bit)}</td><td>${escapeHtml(event.sequence_number)}</td><td>${escapeHtml(event.request_path)}</td><td>${escapeHtml(event.user_agent)}</td><td>${escapeHtml(event.created_at)}</td></tr>`).join("");
-  const html = `<!doctype html><html><head><meta charset="utf-8"><title>Binary run debug</title></head><body><main><h1>Binary run debug</h1><dl><dt>Run ID</dt><dd>${escapeHtml(run!.id)}</dd><dt>Created</dt><dd>${escapeHtml(run!.created_at)}</dd><dt>Expires</dt><dd>${escapeHtml(run!.expires_at)}</dd><dt>Bits</dt><dd><code>${escapeHtml(run!.bits)}</code></dd><dt>Length</dt><dd>${run!.bits.length}</dd></dl><table><thead><tr><th>Event</th><th>Type</th><th>Bit</th><th>Write sequence</th><th>Path</th><th>User agent</th><th>Time</th></tr></thead><tbody>${rows}</tbody></table></main></body></html>`;
+  const rows = events.results.map((event) => `<tr><td>${event.id}</td><td>${escapeHtml(event.event_type)}</td><td>${escapeHtml(event.bit)}</td><td>${escapeHtml(event.sequence_number)}</td><td>${escapeHtml(event.observed_length)}</td><td>${escapeHtml(event.request_path)}</td><td>${escapeHtml(event.user_agent)}</td><td>${escapeHtml(event.created_at)}</td></tr>`).join("");
+  const arm = run!.state === "created" ? `<form method="post" action="/binary/${encodeURIComponent(id)}/arm"><button type="submit">Arm run</button></form>` : "";
+  const html = `<!doctype html><html><head><meta charset="utf-8"><title>Binary run debug</title></head><body><main><h1>Binary run debug</h1><dl><dt>Run ID</dt><dd>${escapeHtml(run!.id)}</dd><dt>State</dt><dd>${escapeHtml(run!.state)}</dd><dt>Created</dt><dd>${escapeHtml(run!.created_at)}</dd><dt>Expires</dt><dd>${escapeHtml(run!.expires_at)}</dd><dt>Bits</dt><dd><code>${escapeHtml(run!.bits)}</code></dd><dt>Length</dt><dd>${run!.bits.length}</dd></dl>${arm}<p>Receipt order is shown below. For writes, Write sequence is the authoritative bit position; receipt IDs may differ under concurrency.</p><table><thead><tr><th>Receipt ID</th><th>Type</th><th>Bit</th><th>Write sequence</th><th>Observed length</th><th>Path</th><th>User agent</th><th>Time</th></tr></thead><tbody>${rows}</tbody></table></main></body></html>`;
   return response(html, 200, "text/html; charset=utf-8");
+}
+
+async function armRun(env: Env, id: string): Promise<Response> {
+  const now = new Date().toISOString();
+  const run = await getRun(env.DB, id);
+  const error = runError(run, now);
+  if (error) return error;
+  await env.DB.prepare("UPDATE binary_runs SET state = 'armed' WHERE id = ? AND state = 'created' AND expires_at > ?")
+    .bind(id, now).run();
+  return response("run_armed\n", 200);
 }
 
 export async function handleBinaryRequest(request: Request, env: Env): Promise<Response> {
   const path = new URL(request.url).pathname;
-  if (path === "/binary/new") return createRun(request, env);
+  if (request.method === "GET" && path === "/binary/new") return createRun(request, env);
+  const armMatch = path.match(/^\/binary\/([^/]+)\/arm$/);
+  if (request.method === "POST" && armMatch) return armRun(env, armMatch[1]);
+  if (request.method !== "GET") return response("not_found\n", 404);
   const match = path.match(/^\/binary\/([^/]+)\/(0|1|read|debug)$/);
   if (!match) return response("not_found\n", 404);
   const [, id, action] = match;
