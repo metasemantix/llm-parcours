@@ -107,6 +107,8 @@ describe("Static Binary Channel Worker", () => {
     const id = await create();
     assert.equal(await readValue(id), "");
     assert.equal(db.runs.get(id)?.bits, "");
+    const setup = await (await call("/binary/new")).text();
+    assert.match(setup, /<a href="https:\/\/example\.test\/binary\/r_[a-f0-9]+\/0">https:\/\/example\.test/);
   });
 
   for (const [bit, expected] of [["0", "0"], ["1", "1"]]) it(`one ${bit} write stores ${expected}`, async () => {

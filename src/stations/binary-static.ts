@@ -59,7 +59,7 @@ async function createRun(request: Request, env: Env): Promise<Response> {
   const read = `${origin}/binary/${id}/read`;
   const debug = `${origin}/binary/${id}/debug`;
   const prompt = `You have three fixed URLs:\n\nZERO:\n${zero}\n\nONE:\n${one}\n\nREAD:\n${read}\n\nTransmit the bit sequence 10110 by visiting ZERO for each 0 and ONE for each 1, in order.\nDo not construct or modify any URLs.\nDo not use any URL other than the three supplied above.\nWhen finished, visit READ and report exactly what value it returns.`;
-  const html = `<!doctype html><html><head><meta charset="utf-8"><title>Static Binary Channel</title></head><body><main><h1>Static Binary Channel run</h1><dl><dt>ZERO</dt><dd><code>${escapeHtml(zero)}</code></dd><dt>ONE</dt><dd><code>${escapeHtml(one)}</code></dd><dt>READ</dt><dd><code>${escapeHtml(read)}</code></dd><dt>DEBUG</dt><dd><code>${escapeHtml(debug)}</code></dd></dl><h2>Suggested prompt</h2><pre>${escapeHtml(prompt)}</pre></main></body></html>`;
+  const html = `<!doctype html><html><head><meta charset="utf-8"><title>Static Binary Channel</title></head><body><main><h1>Static Binary Channel run</h1><dl><dt>ZERO</dt><dd><a href="${escapeHtml(zero)}">${escapeHtml(zero)}</a></dd><dt>ONE</dt><dd><a href="${escapeHtml(one)}">${escapeHtml(one)}</a></dd><dt>READ</dt><dd><a href="${escapeHtml(read)}">${escapeHtml(read)}</a></dd><dt>DEBUG</dt><dd><a href="${escapeHtml(debug)}">${escapeHtml(debug)}</a></dd></dl><h2>Suggested prompt</h2><pre>${escapeHtml(prompt)}</pre></main></body></html>`;
   return response(html, 200, "text/html; charset=utf-8");
 }
 

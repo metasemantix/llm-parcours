@@ -29,6 +29,7 @@ class SQLiteD1 implements D1Database {
   constructor() {
     this.database.exec("PRAGMA foreign_keys = ON;");
     this.database.exec(readFileSync(new URL("../migrations/0001_initial.sql", import.meta.url), "utf8"));
+    this.database.exec(readFileSync(new URL("../migrations/0002_trail_alias.sql", import.meta.url), "utf8"));
   }
   prepare(sql: string) { return new SQLiteStatement(this.database, sql); }
   async batch<T>(statements: D1PreparedStatement[]): Promise<D1Result<T>[]> {
@@ -48,7 +49,7 @@ class SQLiteD1 implements D1Database {
   }
 }
 
-describe("real SQLite/D1 SQL integration", () => {
+describe("SQLite integration for D1-compatible SQL", () => {
   it("applies the migration and exercises arming, atomic appends, reads, expiry, and telemetry", async () => {
     const sqlite = new SQLiteD1();
     const env: Env = { DB: sqlite };
@@ -102,6 +103,80 @@ describe("real SQLite/D1 SQL integration", () => {
     }
     assert.equal(failed, true);
     assert.equal(sqlite.database.prepare("SELECT bits FROM binary_runs WHERE id = 'rollback'").get()?.bits, "");
+    sqlite.database.close();
+  });
+
+  it("exercises trail successors, atomic step claims, replay telemetry, reads, expiry, and cookies", async () => {
+    const sqlite = new SQLiteD1(); const env: Env = { DB: sqlite };
+    const call = (path: string, init?: RequestInit) => worker.fetch(new Request(`https://integration.test${path}`, init), env);
+    const setup = await (await call("/binary-trail/new")).text();
+    const id = setup.match(/\/binary-trail\/(r_[a-f0-9]+)\/entry/)?.[1]; assert.ok(id);
+    let entry = await (await call(`/binary-trail/${id}/entry`)).text();
+    assert.match(entry, /run_not_armed/);
+    assert.equal(/href="[^"]+\/(?:0|1|read)\/[^"]+"/.test(entry), false);
+    const issued = sqlite.database.prepare("SELECT zero_token FROM experiment_runs WHERE id = ?").get(id)?.zero_token; assert.ok(issued);
+    await call(`/binary-trail/${id}/0/0/${issued}`, { headers: { cookie: "preview=yes" } });
+    assert.equal(sqlite.database.prepare("SELECT bits FROM experiment_runs WHERE id = ?").get(id)?.bits, "");
+    assert.equal(sqlite.database.prepare("SELECT event_type FROM experiment_events WHERE run_id = ?").get(id)?.event_type, "pre_arm_request");
+    await call(`/binary-trail/${id}/arm`, { method: "POST" });
+    entry = await (await call(`/binary-trail/${id}/entry`)).text();
+    assert.match(entry, /href="[^"]+\/0\/[^"]+">ZERO</);
+    assert.match(entry, /href="[^"]+\/1\/[^"]+">ONE</);
+    assert.match(entry, /href="[^"]+\/read\/[^"]+">READ</);
+    let page = entry;
+    const used: string[] = [];
+    for (const bit of "01010101") {
+      const label = bit === "0" ? "ZERO" : "ONE";
+      const href = page.match(new RegExp(`href="([^"]+)"[^>]*>${label}<`))?.[1]; assert.ok(href); used.push(href);
+      const response = await call(new URL(href).pathname, { headers: { cookie: `ignored=${bit}` } });
+      assert.equal(response.status, 200); page = await response.text();
+      assert.match(page, /recorded: [01]/); assert.match(page, />ZERO<.*>ONE<.*>READ</);
+    }
+    assert.equal(new Set(used).size, 8);
+    const replay = await call(new URL(used[0]).pathname); assert.equal(replay.status, 409); assert.match(await replay.text(), /trail_step_already_used/);
+    const run = sqlite.database.prepare("SELECT bits, next_step FROM experiment_runs WHERE id = ?").get(id);
+    assert.equal(run?.bits, "01010101"); assert.equal(run?.next_step, 8);
+    const readHref = page.match(/href="([^"]+\/read\/[^"]+)"/)?.[1]; assert.ok(readHref);
+    const read = await call(new URL(readHref).pathname); assert.match(await read.text(), /01010101/);
+    const events = sqlite.database.prepare("SELECT event_type, sequence_number, observed_length, is_replay FROM experiment_events WHERE run_id = ? ORDER BY id").all(id);
+    assert.equal(events.filter(e => e.event_type === "write").length, 8);
+    assert.deepEqual(events.filter(e => e.event_type === "write").map(e => e.sequence_number), [1,2,3,4,5,6,7,8]);
+    assert.equal(events.some(e => e.event_type === "replay" && e.is_replay === 1), true);
+    assert.equal(events.some(e => e.event_type === "read" && e.observed_length === 8), true);
+    assert.equal(read.headers.get("cache-control"), "no-store, no-cache, must-revalidate");
+    assert.equal((await call("/binary-trail/missing/entry")).status, 404);
+    sqlite.database.prepare("INSERT INTO experiment_runs (id, station, bits, state, created_at, expires_at) VALUES ('oldtrail','trail','','armed','2000','2001')").run();
+    assert.equal((await call("/binary-trail/oldtrail/entry")).status, 410);
+    assert.equal(events.every(e => !("cookie" in e)), true);
+    sqlite.database.close();
+  });
+
+  it("exercises alias distinct suffixes, single-use replay, mixed order, reads, and atomic rollback", async () => {
+    const sqlite = new SQLiteD1(); const env: Env = { DB: sqlite };
+    const call = (path: string, init?: RequestInit) => worker.fetch(new Request(`https://integration.test${path}`, init), env);
+    const setup = await (await call("/binary-alias/new")).text();
+    const id = setup.match(/\/binary-alias\/(r_[a-f0-9]+)\/0\/a/)?.[1]; assert.ok(id);
+    await call(`/binary-alias/${id}/0/pre`, { headers: { cookie: "ignored=yes" } });
+    assert.equal(sqlite.database.prepare("SELECT bits FROM experiment_runs WHERE id = ?").get(id)?.bits, "");
+    await call(`/binary-alias/${id}/arm`, { method: "POST" });
+    for (const suffix of ["a", "b", "c"]) await call(`/binary-alias/${id}/0/${suffix}`);
+    assert.equal(sqlite.database.prepare("SELECT bits FROM experiment_runs WHERE id = ?").get(id)?.bits, "000");
+    for (const suffix of ["a", "b", "c"]) await call(`/binary-alias/${id}/1/${suffix}`);
+    assert.equal(sqlite.database.prepare("SELECT bits FROM experiment_runs WHERE id = ?").get(id)?.bits, "000111");
+    assert.equal((await call(`/binary-alias/${id}/1/a`)).status, 409);
+    await call(`/binary-alias/${id}/0/x`); await call(`/binary-alias/${id}/1/x`);
+    const beforeRead = sqlite.database.prepare("SELECT bits FROM experiment_runs WHERE id = ?").get(id)?.bits;
+    const read = await call(`/binary-alias/${id}/read/result`); assert.match(await read.text(), /00011101/);
+    assert.equal(sqlite.database.prepare("SELECT bits FROM experiment_runs WHERE id = ?").get(id)?.bits, beforeRead);
+    assert.equal(read.headers.get("pragma"), "no-cache");
+    assert.equal((await call("/binary-alias/missing/0/a")).status, 404);
+    sqlite.database.prepare("INSERT INTO experiment_runs (id, station, bits, state, created_at, expires_at) VALUES ('oldalias','alias','','armed','2000','2001')").run();
+    assert.equal((await call("/binary-alias/oldalias/0/a")).status, 410);
+    const replay = sqlite.database.prepare("SELECT is_replay FROM experiment_events WHERE run_id = ? AND event_type = 'replay'").get(id); assert.equal(replay?.is_replay, 1);
+    assert.equal(sqlite.database.prepare("SELECT COUNT(*) AS n FROM experiment_events WHERE run_id = ? AND event_type = 'pre_arm_request'").get(id)?.n, 1);
+    sqlite.database.prepare("INSERT INTO experiment_runs (id, station, bits, state, created_at, expires_at) VALUES ('rollback2','alias','','armed','2000','2999')").run();
+    let failed = false; try { await sqlite.batch([sqlite.prepare("UPDATE experiment_runs SET bits = bits || '1' WHERE id = 'rollback2'"), sqlite.prepare("INSERT INTO missing_telemetry VALUES (1)")]); } catch { failed = true; }
+    assert.equal(failed, true); assert.equal(sqlite.database.prepare("SELECT bits FROM experiment_runs WHERE id = 'rollback2'").get()?.bits, "");
     sqlite.database.close();
   });
 });
