@@ -275,3 +275,16 @@ describe("parcours_bulk_input search-referrer probe", () => {
     assert.match(await (await call("/")).text(), /<a href="\/experiments\/parcours_bulk_input">/);
   });
 });
+
+describe("Google Search Console verification", () => {
+  it("serves the exact verification file without recording a bulk-input observation", async () => {
+    const db = new FakeD1();
+    const env: Env = { DB: db as unknown as D1Database };
+    const response = await worker.fetch(new Request("https://example.test/google489597deee918027.html"), env);
+
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("content-type"), "text/html; charset=utf-8");
+    assert.equal(await response.text(), "google-site-verification: google489597deee918027.html");
+    assert.equal(db.observations.length, 0);
+  });
+});
