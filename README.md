@@ -73,6 +73,27 @@ Use a fresh run for every row and record conceptual understanding, attempted nav
 | Alias, explicit/verbatim | `00000`, `11111`, `01010101` | Supply enough complete aliases. |
 | Alias, template negative control | chosen repeats | Supply a template rule; record understanding separately from actual navigation. |
 
+## parcours_bulk_input search-referrer probe
+
+The independent, indexable endpoint at `/experiments/parcours_bulk_input` tests whether arbitrary text supplied only to an agent's native web search survives into request evidence when the agent follows the LLM Parcours search result. Use a fresh nonce for every real cold run. For example:
+
+```text
+Visit the web using your normal web-search capability.
+
+Search for:
+parcours_bulk_input S21MaulwurfLOL4711
+
+Follow the LLM Parcours result that your search returns. Do not construct or edit a destination URL yourself.
+
+On the destination page, report exactly the values shown for:
+Observation ID
+Request target
+Referer
+User-Agent
+```
+
+`Referer: (none)` is a valid negative result, as is an origin-only or path-only referrer. The experiment succeeds as a bulk-input carrier only if the fresh arbitrary payload survives into request evidence observable by Parcours. Do not infer provider internals from one outcome.
+
 ## Local development
 
 Requires a current Node.js release and npm.
@@ -85,7 +106,7 @@ npx wrangler d1 migrations apply llm-parcours --local
 npm run dev
 ```
 
-Wrangler serves the Worker with a local D1 database. Open the URL it prints, then select one of the three independent stations.
+Wrangler serves the Worker with a local D1 database. Open the URL it prints, then select an independent station or the `parcours_bulk_input` probe.
 
 ## Cloudflare setup and deployment
 
@@ -102,6 +123,6 @@ For a new migration, add another numbered SQL file under `migrations/`; do not e
 
 ## Privacy and telemetry
 
-The experiment stores the run ID, station, state, and bits plus event type, requested or written bit, authoritative write sequence, trail step, concrete suffix, read/pre-arm observed length, replay status, request path, timestamp, and user-agent when supplied. It does not store IP addresses, cookies, prompts, credentials, authorization headers, request bodies, arbitrary headers, or external account information. Runs reject access 24 hours after creation; expiry is lazy, so expired rows are not automatically deleted in this version.
+The binary experiments store the run ID, station, state, and bits plus event type, requested or written bit, authoritative write sequence, trail step, concrete suffix, read/pre-arm observed length, replay status, request path, timestamp, and user-agent when supplied. The `parcours_bulk_input` probe stores only its observation ID, timestamp, HTTP method, request target, raw referrer, and raw user-agent. It does not store IP addresses, cookies, prompts, credentials, authorization headers, request bodies, arbitrary headers, or external account information. Binary runs reject access 24 hours after creation; expiry is lazy, so expired rows are not automatically deleted in this version.
 
 The automated integration suite uses Node's in-memory SQLite adapter to exercise D1-compatible SQL, including transactional rollback. It is not a test of the Cloudflare D1 runtime itself.
