@@ -20,6 +20,11 @@ export default {
       if (url.pathname.startsWith("/binary-trail/")) return await handleDynamicRequest(request, env, "trail");
       if (url.pathname.startsWith("/binary-alias/")) return await handleDynamicRequest(request, env, "alias");
       if (request.method !== "GET") return notFound();
+      if (url.pathname === "/google489597deee918027.html") {
+        return new Response("google-site-verification: google489597deee918027.html", {
+          headers: { "Content-Type": "text/html; charset=utf-8" },
+        });
+      }
       if (url.pathname === "/experiments/parcours_bulk_input") return await handleBulkInputRequest(request, env);
       if (url.pathname === "/robots.txt") return robotsResponse(request);
       if (url.pathname === "/sitemap.xml") return sitemapResponse(request);
