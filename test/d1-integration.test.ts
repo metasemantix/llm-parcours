@@ -30,6 +30,7 @@ class SQLiteD1 implements D1Database {
     this.database.exec("PRAGMA foreign_keys = ON;");
     this.database.exec(readFileSync(new URL("../migrations/0001_initial.sql", import.meta.url), "utf8"));
     this.database.exec(readFileSync(new URL("../migrations/0002_trail_alias.sql", import.meta.url), "utf8"));
+    this.database.exec(readFileSync(new URL("../migrations/0003_bulk_input_observations.sql", import.meta.url), "utf8"));
   }
   prepare(sql: string) { return new SQLiteStatement(this.database, sql); }
   async batch<T>(statements: D1PreparedStatement[]): Promise<D1Result<T>[]> {
@@ -50,6 +51,22 @@ class SQLiteD1 implements D1Database {
 }
 
 describe("SQLite integration for D1-compatible SQL", () => {
+  it("persists the exact bulk-input request evidence rendered by the Worker", async () => {
+    const sqlite = new SQLiteD1();
+    const referrer = "https://search.example/?q=parcours_bulk_input+nonce-7q41&x=<raw>";
+    const response = await worker.fetch(new Request("https://integration.test/experiments/parcours_bulk_input?unexpected=yes", { headers: { referer: referrer, "user-agent": "agent<&>" } }), { DB: sqlite });
+    assert.equal(response.status, 200);
+    const html = await response.text();
+    const row = sqlite.database.prepare("SELECT * FROM bulk_input_observations").get();
+    assert.equal(row?.referrer, referrer);
+    assert.equal(row?.request_target, "/experiments/parcours_bulk_input?unexpected=yes");
+    assert.equal(row?.user_agent, "agent<&>");
+    assert.match(html, new RegExp(String(row?.id)));
+    assert.match(html, new RegExp(String(row?.observed_at)));
+    assert.equal(sqlite.database.prepare("SELECT COUNT(*) AS count FROM bulk_input_observations").get()?.count, 1);
+    sqlite.database.close();
+  });
+
   it("applies the migration and exercises arming, atomic appends, reads, expiry, and telemetry", async () => {
     const sqlite = new SQLiteD1();
     const env: Env = { DB: sqlite };

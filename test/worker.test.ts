@@ -4,6 +4,7 @@ import worker, { type Env } from "../src/index.ts";
 
 type Run = { id: string; bits: string; state: "created" | "armed"; created_at: string; expires_at: string };
 type Event = { id: number; run_id: string; event_type: string; bit: number | null; sequence_number: number | null; observed_length: number | null; request_path: string; user_agent: string | null; created_at: string };
+type Observation = { id: string; observed_at: string; method: string; request_target: string; referrer: string | null; user_agent: string | null };
 
 class FakeStatement {
   private values: unknown[] = [];
@@ -25,7 +26,11 @@ class FakeStatement {
     throw new Error(`Unhandled first: ${this.sql}`);
   }
   async run(): Promise<D1Result> {
-    if (this.sql.startsWith("INSERT INTO binary_runs")) {
+    if (this.sql.startsWith("INSERT INTO bulk_input_observations")) {
+      if (this.db.failObservationInsert) throw new Error("simulated insertion failure");
+      const [id, observed_at, method, request_target, referrer, user_agent] = this.values;
+      this.db.observations.push({ id: String(id), observed_at: String(observed_at), method: String(method), request_target: String(request_target), referrer: referrer as string | null, user_agent: user_agent as string | null });
+    } else if (this.sql.startsWith("INSERT INTO binary_runs")) {
       const [id, created_at, expires_at] = this.values.map(String);
       this.db.runs.set(id, { id, bits: "", state: "created", created_at, expires_at });
     } else if (this.sql.startsWith("INSERT INTO binary_events")) {
@@ -55,6 +60,8 @@ class FakeD1 {
   events: Event[] = [];
   eventId = 0;
   failNextWriteEvent = false;
+  failObservationInsert = false;
+  observations: Observation[] = [];
   prepare(sql: string) { return new FakeStatement(this, sql); }
   async batch<T>(statements: D1PreparedStatement[]): Promise<D1Result<T>[]> {
     const runs = new Map([...this.runs].map(([id, run]) => [id, { ...run }]));
@@ -201,5 +208,70 @@ describe("Static Binary Channel Worker", () => {
     await call(`/binary/${id}/1`, { headers: { cookie: "session=other" } });
     assert.equal(await readValue(id), "01");
     assert.equal(db.events.every((event) => !("cookie" in event)), true);
+  });
+});
+
+describe("parcours_bulk_input search-referrer probe", () => {
+  let db: FakeD1;
+  let env: Env;
+  beforeEach(() => { db = new FakeD1(); env = { DB: db as unknown as D1Database }; });
+  const call = (path: string, init?: RequestInit) => worker.fetch(new Request(`https://example.test${path}`, init), env);
+
+  it("renders the marker, explicit absent values, canonical URL, and matching persisted evidence", async () => {
+    const response = await call("/experiments/parcours_bulk_input");
+    assert.equal(response.status, 200);
+    assert.match(response.headers.get("content-type") ?? "", /text\/html/);
+    const html = await response.text();
+    assert.match(html, /<title>parcours_bulk_input/);
+    assert.match(html, /<h1>parcours_bulk_input<\/h1>/);
+    assert.match(html, /Referer:<\/dt><dd>\(none\)<\/dd>/);
+    assert.match(html, /rel="canonical" href="https:\/\/example\.test\/experiments\/parcours_bulk_input"/);
+    assert.equal(db.observations.length, 1);
+    const observation = db.observations[0]!;
+    assert.equal(observation.method, "GET");
+    assert.equal(observation.request_target, "/experiments/parcours_bulk_input");
+    assert.equal(observation.referrer, null);
+    assert.match(html, new RegExp(observation.id));
+    assert.match(html, new RegExp(observation.observed_at));
+  });
+
+  it("preserves raw headers and query target in storage while escaping HTML", async () => {
+    const referrer = "https://search.example/?q=parcours_bulk_input+nonce-7q41&tag=<script>alert(1)</script>";
+    const userAgent = "probe<svg onload=alert(1)>&agent";
+    const response = await call("/experiments/parcours_bulk_input?unexpected=a%2Bb&x=1", { headers: { referer: referrer, "user-agent": userAgent } });
+    const html = await response.text();
+    assert.equal(response.status, 200);
+    assert.equal(db.observations[0]?.referrer, referrer);
+    assert.equal(db.observations[0]?.user_agent, userAgent);
+    assert.equal(db.observations[0]?.request_target, "/experiments/parcours_bulk_input?unexpected=a%2Bb&x=1");
+    assert.equal(/<script>|<svg/.test(html), false);
+    assert.match(html, /&lt;script&gt;alert\(1\)&lt;\/script&gt;/);
+    assert.match(html, /probe&lt;svg onload=alert\(1\)&gt;&amp;agent/);
+    assert.match(html, /unexpected=a%2Bb&amp;x=1/);
+  });
+
+  it("prevents cache reuse", async () => {
+    const response = await call("/experiments/parcours_bulk_input");
+    assert.equal(response.headers.get("cache-control"), "no-store, no-cache, must-revalidate");
+    assert.equal(response.headers.get("pragma"), "no-cache");
+    assert.equal(response.headers.get("expires"), "0");
+  });
+
+  it("returns a deterministic cached-disabled server error when persistence fails", async () => {
+    db.failObservationInsert = true;
+    const response = await call("/experiments/parcours_bulk_input");
+    assert.equal(response.status, 500);
+    assert.equal(await response.text(), "internal_error\n");
+    assert.equal(response.headers.get("cache-control"), "no-store, no-cache, must-revalidate");
+  });
+
+  it("publishes provider-neutral discovery routes and a root link", async () => {
+    const robots = await call("/robots.txt");
+    assert.equal(robots.status, 200);
+    assert.match(await robots.text(), /Allow: \/\nSitemap: https:\/\/example\.test\/sitemap\.xml/);
+    const sitemap = await call("/sitemap.xml");
+    assert.match(sitemap.headers.get("content-type") ?? "", /application\/xml/);
+    assert.equal(await sitemap.text(), '<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"><url><loc>https://example.test/</loc></url><url><loc>https://example.test/experiments/parcours_bulk_input</loc></url></urlset>\n');
+    assert.match(await (await call("/")).text(), /<a href="\/experiments\/parcours_bulk_input">/);
   });
 });
