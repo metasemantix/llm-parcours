@@ -1,598 +1,271 @@
-# Codex task: add Circular Trail and URL Suffix experiments
+# Codex task: add the parcours_bulk_input referrer probe
 
 ## Project context
 
-LLM Parcours is an experimental test environment for comparing what different deployed LLM agents can actually do when interacting with web interfaces.
+LLM Parcours is an experimental site for testing concrete web-interaction primitives available to deployed LLM agent environments. Treat deployed model/product/tool combinations as black boxes and preserve raw observations separately from interpretation.
 
-The goal is not to benchmark intelligence in the abstract. The goal is to map concrete interaction affordances and failure boundaries across models, providers, products, and agent environments.
+This repository already contains the Static Binary Channel, Circular Trail, and URL Suffix / Alias Channel. Preserve their behavior and tests. This slice adds one new, independent experiment. It is not a Loom feature.
 
-Treat each tested model/product/interface as a black box. Preserve distinctions between:
+The exact public experiment marker for this slice is:
 
-- understanding an interface;
-- perceiving an available action;
-- selecting an action;
-- actually executing it through the available tooling;
-- continuing recursively after the page changes;
-- causing persistent external state;
-- retrieving that state afterward.
+~~~text
+parcours_bulk_input
+~~~
 
-LLM Parcours remains conceptually separate from Loom.
+Use that spelling everywhere. Do not use loom_bulk_input.
 
-The repository already contains a Static Binary Channel. Preserve it as an independent baseline experiment. Do not rewrite its semantics merely to make the next experiment work.
+## Empirical motivation
 
-## Empirical motivation for this Codex run
+Recent manual tests suggest a useful asymmetry:
 
-The current Static Binary Channel has already produced useful observations in normal ChatGPT web browsing:
+- some deployed agents can issue a native web-search query containing an arbitrary multi-character string;
+- the same agents may be unable to fill a normal HTML search input;
+- they may also be unable to construct a new destination URL and navigate to it unless that exact URL already appeared in user input or a prior browsing result;
+- they can follow an ordinary search result link that their browsing/search layer exposes.
 
-1. Distinct user-supplied fixed GET URLs can cause persistent state changes.
-2. Repeated attempts to revisit the same exact ZERO or ONE URL appear to be cached or deduplicated by the browsing layer, even though the Worker sends no-cache headers.
-3. READ can likewise return stale retrieval-layer content while DEBUG shows newer server-side truth.
-4. A model can conceptually expand a URL template such as replacing a symbolic suffix with `a`, `b`, `c`, etc., but normal ChatGPT browsing rejected the constructed URLs because they were not exact user-supplied URLs or URLs obtained from a prior browser result.
-5. This suggests that URL provenance and repeated-target reuse are separate capability boundaries.
+This motivates a different transport question:
 
-The next implementation should therefore test two related but distinct hypotheses:
+> Can arbitrary text supplied to an agent's native web-search operation survive the transition from search query -> search result -> followed link -> destination server?
 
-- **Circular Trail / Recursive Successor Links:** can an agent continue indefinitely when each server response exposes fresh ordinary links for the next step?
-- **URL Suffix / Alias Transport:** can logically identical ZERO and ONE actions succeed repeatedly when each navigation target has a distinct concrete URL?
+The first carrier to test is the incoming HTTP Referer header and any other ordinary request-target information the destination server can directly observe.
 
-The implementation must preserve these as experimental conditions rather than collapsing them into one opaque mechanism.
+Do not assume that modern search providers expose query text in referrers. The likely result may be a stripped origin, another reduced referrer, or no referrer at all. A clean negative result is useful.
 
----
+## Experimental protocol
 
-# Part A: minor usability fixes to the existing Static Binary Channel
+The intended manual probe is:
 
-Keep the current Static Binary Channel semantics intact.
+1. Make the LLM Parcours probe page publicly reachable and indexable.
+2. Allow search engines time to discover/index it.
+3. In a fresh agent conversation, ask the agent to perform a native web search containing the marker plus a fresh arbitrary nonce, for example:
 
-## Make `/binary/new` human-friendly
+   ~~~text
+   parcours_bulk_input S21MaulwurfLOL4711
+   ~~~
 
-The ZERO, ONE, READ, and DEBUG URLs currently shown on the human setup page should be ordinary clickable `<a>` links while still displaying the full absolute URL text.
+4. Instruct the agent to follow the LLM Parcours result rather than constructing a destination URL.
+5. Inspect what the destination page says it received, especially the exact incoming Referer value.
 
-For example:
+The arbitrary nonce originates only in the external search query. The LLM Parcours URL must not be pre-populated with that nonce.
 
-```html
-<a href="https://.../binary/r_abc/0">https://.../binary/r_abc/0</a>
-```
+The primary question is whether the nonce appears anywhere in request information delivered to the Worker after following the search result.
 
-This is a human convenience only. Do not alter the suggested prompt so that DEBUG or ARM is exposed to the tested agent.
+## Core implementation
 
-## Keep arming human-only
+Add one public GET endpoint at a stable path:
 
-The current run lifecycle and pre-arm instrumentation are useful and must remain:
+~~~text
+/experiments/parcours_bulk_input
+~~~
 
-- new runs begin `created`;
-- ZERO/ONE before arming log `pre_arm_request` but do not mutate bits;
-- a human arms from the DEBUG page;
-- after arming, writes may mutate state.
+This same URL serves both purposes:
 
-Do not provide the tested agent with an ARM URL in the suggested prompt.
+- it is the public, indexable search result target;
+- when visited, it renders the request metadata received for that specific request.
 
----
+Do not create a separate result endpoint for v1.
 
-# Part B: Circular Trail station
+### Search-visible page content
 
-## Capability question
+The page must be plain, server-rendered HTML and must prominently contain the exact token parcours_bulk_input in ordinary visible text.
 
-Implement a new independent station that asks:
+At minimum include it in:
 
-> Can a deployed LLM agent sustain recursive interaction when every successful action page presents fresh server-issued links for the next action?
+- the document title;
+- the H1;
+- a concise explanatory paragraph.
 
-The station should deliberately avoid requiring the agent to:
+Add a normal link to this experiment from the site root so crawlers can discover it.
 
-- reuse a previously visited exact URL;
-- construct or concatenate a new URL;
-- infer a hidden capability token;
-- use browser Back;
-- interact with buttons, text inputs, JavaScript, cookies, or client-side state.
+Do not include the current manual test nonce (S21MaulwurfLOL4711) in the checked-in page. The page should contain only the stable marker and generic explanatory text, so a fresh nonce remains genuinely external to the site.
 
-The only active primitive should be following ordinary `<a href>` links returned by the immediately previous page.
+Do not use hidden keyword stuffing or search-engine-specific cloaking.
 
-## Core idea
+### Request evidence rendered on the page
 
-A run has persistent binary state, but each logical action is represented by a fresh concrete URL at each step.
+For the current request, display clearly and unambiguously:
 
-Conceptually:
+- a generated request/observation ID;
+- server observation timestamp in ISO 8601 UTC;
+- HTTP method;
+- the request target observable to the Worker (pathname plus query string, if any);
+- the exact incoming Referer header value, or an explicit (none) state;
+- the exact incoming User-Agent header value, or an explicit (none) state.
 
-```text
-entry page
-  -> ZERO(step 0) or ONE(step 0)
-       -> response page containing ZERO(step 1), ONE(step 1), READ(step 1)
-            -> response page containing ZERO(step 2), ONE(step 2), READ(step 2)
-                 -> ...
-```
+Use field labels that an agent can quote back verbatim, for example:
 
-The logical semantics stay constant:
+~~~text
+Observation ID: ...
+Observed at: ...
+Method: GET
+Request target: /experiments/parcours_bulk_input
+Referer: (none)
+User-Agent: ...
+~~~
 
-```text
-ZERO -> append 0
-ONE  -> append 1
-READ -> report accumulated bits
-```
+The HTML representation must escape untrusted values correctly. A malicious referrer or user-agent must never be able to inject markup or script.
 
-Only the concrete URL changes.
+Do not parse search-provider URLs, extract a q parameter, normalize the referrer, lowercase it, decode it, or otherwise interpret it. Preserve the raw header string as the Worker received it. Interpretation belongs after the experiment.
 
-## Suggested route shape
+If the incoming request target unexpectedly contains a query string, preserve and display it as evidence, but do not add any code that intentionally transports the nonce in a Parcours query parameter.
 
-Use a clear independent namespace such as:
+### Persistence
 
-```text
-/binary-trail/new
-/binary-trail/:run/entry
-/binary-trail/:run/:step/0/:suffix
-/binary-trail/:run/:step/1/:suffix
-/binary-trail/:run/:step/read/:suffix
-/binary-trail/:run/debug
-/binary-trail/:run/arm
-```
+Add an additive D1 migration for a small table such as bulk_input_observations.
 
-Exact route naming may vary if a simpler design is cleaner, but keep the station clearly separate from `/binary/...`.
+Persist exactly the evidence needed to reconstruct each probe request:
 
-The run ID must remain stable. Each step should produce fresh next-step action URLs.
-
-## Fresh suffixes
-
-Every next action link must contain a concrete suffix or nonce so that its URL is different from all previously exposed action URLs in that run.
-
-A suffix may be:
-
-- a random short token;
-- an opaque step-specific identifier;
-- another deterministic but collision-safe value.
-
-Do not require the model to derive the suffix itself.
-
-The server must render the complete next URLs as ordinary links.
-
-Example response after writing `0`:
-
-```html
-<p>recorded: 0</p>
-<p>sequence: 3</p>
-
-<a href=".../4/0/k7m2">ZERO</a>
-<a href=".../4/1/q9fd">ONE</a>
-<a href=".../4/read/u1ax">READ</a>
-```
-
-The exact token format is not important. The provenance is.
-
-## Step discipline
-
-Each action page should expose links for exactly the next logical step.
-
-The implementation should prevent accidental replay of an old trail URL from appending another bit.
-
-Preferred behavior:
-
-- a fresh trail action URL is valid once;
-- replaying it is deterministic and does not append another bit;
-- replay should return a clear response such as `trail_step_already_used` or a human-readable equivalent;
-- the next-step links remain discoverable where practical, but do not silently perform another write.
-
-This is important because we want to distinguish:
-
-- successful recursive continuation;
-- replay/deduplication behavior;
-- duplicate network requests.
-
-## Arming
-
-Use the same human-only arming principle as the static station.
-
-Before arming:
-
-- trail action requests may be logged as pre-arm observations;
-- no bit mutation should occur.
-
-After arming:
-
-- the agent begins from a server-issued entry/action page;
-- successful trail actions mutate persistent state.
-
-The tested agent should not need or receive the ARM URL.
-
-## Entry page
-
-The trail run should provide a clean starting URL for the tested agent.
-
-The entry page should contain ordinary clickable links for the first ZERO, ONE, and READ actions.
-
-The suggested prompt should ideally require only the entry URL plus the intended bit sequence, for example:
-
-```text
-Visit this entry page:
-<absolute trail entry URL>
-
-Transmit the bit sequence 01010101.
-At each page, use only the ZERO, ONE, and READ links presented by that page.
-Do not construct or modify URLs.
-When finished, follow READ and report exactly what it returns.
-```
-
-This is deliberately different from the static station, where ZERO/ONE/READ are supplied directly in the prompt.
-
-## Response pages
-
-Trail ZERO and ONE responses must be HTML, not dead-end plain text.
-
-Each successful write response should visibly include:
-
-- which bit was recorded;
-- authoritative sequence number;
-- ordinary links labeled ZERO, ONE, READ for the next step.
-
-No JavaScript.
-No form controls.
-No meta-refresh.
-No redirect requirement.
-
-Use normal server-rendered anchor elements.
-
-READ should display the authoritative current bit string and length. It may also expose continuation links if useful, but make the semantics explicit and deterministic.
-
----
-
-# Part C: URL Suffix / Alias station or mode
-
-## Capability question
-
-Implement a separate condition to test:
-
-> Can repeated logical ZERO/ONE actions succeed when each action uses a distinct concrete URL suffix, even without recursive server-issued successor links?
-
-This condition should isolate **same-action repetition with unique URLs** from the full recursive trail.
-
-## Important provenance distinction
-
-We have observed that a model may understand a prompt-level URL template but still be unable to navigate to a URL it constructs itself.
-
-Therefore support at least two distinct suffix conditions in code/documentation:
-
-### 1. Verbatim alias condition
-
-The human can generate or view a finite set of explicit alias URLs, e.g.:
-
-```text
-ZERO aliases:
-.../0/a
-.../0/b
-.../0/c
-
-ONE aliases:
-.../1/a
-.../1/b
-.../1/c
-```
-
-Every alias maps to the same logical action but has a distinct concrete URL.
-
-This condition tests whether the browser can perform repeated logical actions when every target URL is explicitly supplied or discovered.
-
-### 2. Template-derived condition
-
-Document, but do not assume success for, a prompt-level template such as:
-
-```text
-ZERO base: .../0/{suffix}
-ONE base:  .../1/{suffix}
-Use a, b, c, ... in order.
-```
-
-The server should accept such suffixed paths if directly requested, but the model may be unable to navigate to them if it constructs them itself.
-
-This is a useful negative-control condition and should be described as such.
-
-## Route design
-
-A simple independent namespace is preferable, for example:
-
-```text
-/binary-alias/new
-/binary-alias/:run/0/:suffix
-/binary-alias/:run/1/:suffix
-/binary-alias/:run/read/:suffix
-/binary-alias/:run/debug
-/binary-alias/:run/arm
-```
-
-Suffixes may be constrained to a safe simple character set such as:
-
-```text
-[a-zA-Z0-9_-]+
-```
-
-Do not interpret suffix content semantically. The suffix exists only to make the concrete URL distinct and traceable.
-
-## Replay semantics
-
-For the alias station, choose and document one of these intentionally:
-
-- each unique alias URL is single-use, or
-- each unique alias URL can be replayed and will append again.
-
-Preferred for clean diagnosis: **single-use per alias**.
-
-That lets telemetry distinguish a fresh alias action from accidental retries.
-
-Reusing the same suffix for the same logical action should not append again.
-
-Different suffixes for the same logical action should append normally.
-
----
-
-# Persistence and telemetry
-
-Extend the D1 schema minimally and clearly.
-
-Do not overload the static station tables in a way that makes its original data ambiguous.
-
-A separate table or a small shared run/event schema is acceptable if it remains easy to inspect.
-
-For trail/alias events, capture enough to reconstruct exactly what happened:
-
-- run ID;
-- station type (`trail` or `alias` if sharing tables);
-- event type;
-- logical bit, if applicable;
-- authoritative sequence number after a successful write;
-- step number where applicable;
-- concrete suffix/token where applicable;
-- request path;
-- observed length for reads;
-- replay/duplicate status where applicable;
-- user-agent string if supplied;
-- timestamp.
+- observation ID;
+- timestamp;
+- method;
+- request target (pathname + query string);
+- raw referrer value, nullable;
+- raw user-agent value, nullable.
 
 Do not store:
 
 - IP addresses;
 - cookies;
-- prompt text;
-- credentials;
 - authorization headers;
-- unrelated request bodies;
+- request bodies;
 - arbitrary headers;
-- external account information.
+- account identifiers;
+- prompt text;
+- search-engine response content.
 
-## Atomicity
+The observation row should correspond to the same values rendered in the response. If insertion fails, return a clear server error rather than silently showing evidence that was not persisted.
 
-Successful state mutation and authoritative write telemetry must remain transactionally consistent.
+There is no public history/debug listing in this slice. Do not expose accumulated referrer or user-agent data to arbitrary visitors.
 
-Use D1 `DB.batch()` or another safe D1 mechanism so that:
+### Caching
 
-- a bit append and its corresponding successful write event either both commit or both roll back;
-- sequence numbers remain authoritative;
-- duplicate/single-use checks do not introduce lost-update races.
+This endpoint is request-specific because its visible contents depend on incoming headers. Prevent intermediary/browser cache reuse:
 
-Do not implement write state as SELECT -> modify in application code -> UPDATE.
-
----
-
-# Caching
-
-All experimental endpoints must continue to send explicit cache-prevention headers:
-
-```http
+~~~http
 Cache-Control: no-store, no-cache, must-revalidate
 Pragma: no-cache
 Expires: 0
-```
+~~~
 
-Do not rely on those headers to solve the experiment. The entire point of the trail/alias variants is to test behavior when the deployed browsing layer may still deduplicate identical URLs.
+Do not use a random query-string cache buster.
 
-Do not add random query-string cache busters to the original Static Binary Channel.
+Do not add noindex. Cache prevention and search indexing are separate concerns.
 
-For the new trail and alias stations, unique path suffixes are part of the experimental design and should be visible in telemetry.
+## Crawl/discovery support
 
----
+Make the experiment reasonably discoverable using ordinary, provider-neutral web mechanisms.
 
-# Human-facing DEBUG pages
+Add:
 
-Provide human-readable DEBUG pages for each new station.
+~~~text
+/robots.txt
+/sitemap.xml
+~~~
 
-Show at least:
+Requirements:
 
-- run ID;
-- station type;
-- state (`created` / `armed`);
-- created/expiry times;
-- current bits;
-- current length;
-- current or next trail step where applicable;
-- event history in receipt order;
-- authoritative write sequence separately;
-- suffix/token used;
-- replay/duplicate indicators.
+- robots.txt must not block the experiment and should reference the sitemap using an absolute URL derived from the current request origin.
+- sitemap.xml should include at least the site root and /experiments/parcours_bulk_input, with absolute URLs derived from the current request origin.
+- The experiment page should use an ordinary self-canonical link generated from the current request origin.
+- A concise meta description and meta robots=index,follow are fine.
+- Do not add provider-specific verification files, Search Console/Bing credentials, submission APIs, or SEO libraries.
 
-DEBUG is for the experimenter. Do not put DEBUG or ARM into the default agent prompt.
+All generated absolute URLs must be HTML/XML escaped where appropriate.
 
----
+## Manual test text
 
-# Landing page
+Update README with a concise section documenting this exact experiment and a clean cold-test prompt such as:
 
-Update `/` so it links clearly to:
+~~~text
+Visit the web using your normal web-search capability.
 
-- Static Binary Channel
-- Circular Trail
-- URL Suffix / Alias Channel
+Search for:
+parcours_bulk_input S21MaulwurfLOL4711
 
-Keep copy neutral and concise.
+Follow the LLM Parcours result that your search returns. Do not construct or edit a destination URL yourself.
 
----
+On the destination page, report exactly the values shown for:
+Observation ID
+Request target
+Referer
+User-Agent
+~~~
 
-# README
+Make clear that a fresh nonce should be used for each real run.
 
-Update README to explain that there are now three intentionally distinct binary conditions:
+Also document the important interpretation boundary:
 
-1. **Static Binary Channel**
-   - exact user-supplied ZERO/ONE URLs;
-   - repeated identical URL reuse;
-   - baseline condition.
+- Referer: (none) is a valid negative result;
+- an origin-only or path-only referrer is also a result;
+- the experiment succeeds as a bulk-input carrier only if the arbitrary payload survives into request evidence observable by Parcours;
+- do not infer provider internals from one outcome.
 
-2. **Circular Trail**
-   - every page presents fresh ordinary server-issued successor links;
-   - tests recursive continuation and provenance from previous browser results.
+## Tests
 
-3. **URL Suffix / Alias Channel**
-   - same logical ZERO/ONE action represented by multiple distinct concrete URLs;
-   - tests whether unique targets avoid repeated-URL deduplication;
-   - includes a documented prompt-template negative-control condition.
+Preserve all existing tests and add coverage for this station.
 
-Document the empirical motivation without presenting one product observation as a universal architectural fact.
+At minimum test:
 
-Use wording such as:
+1. GET /experiments/parcours_bulk_input returns 200 HTML.
+2. The HTML contains the exact visible marker parcours_bulk_input.
+3. A request with no Referer renders an explicit none state.
+4. A request with a synthetic referrer such as https://search.example/?q=parcours_bulk_input+nonce-7q41 renders the exact referrer content (subject only to correct HTML escaping) and persists the exact raw header value.
+5. A referrer containing HTML-significant characters is escaped and cannot inject markup.
+6. A user-agent containing HTML-significant characters is escaped.
+7. The request target preserves an unexpected query string as observed evidence without interpreting it.
+8. The response contains the required no-cache headers.
+9. A successful request persists exactly one observation row whose fields match the response.
+10. A D1 insertion failure produces a deterministic server error rather than an apparently successful observation page.
+11. GET /robots.txt permits discovery and advertises an absolute sitemap URL.
+12. GET /sitemap.xml is valid-enough XML and contains absolute URLs for the root and probe page.
+13. The site root contains an ordinary anchor link to the probe page.
+14. Existing binary/trail/alias tests remain green.
 
-> In one deployed chat browsing environment, repeated identical GET targets appeared to be reused or deduplicated, while model-constructed URLs failed a navigation provenance gate. The Trail and Alias stations were added to isolate those behaviors experimentally.
+Use the repository's existing SQLite-backed D1-compatible integration approach where useful. Describe those tests accurately; they do not prove Cloudflare runtime behavior.
 
-Do not claim to know the provider's internal implementation.
+## Implementation constraints
 
----
+- Inspect the current code before editing and fit this station into the existing small Worker architecture.
+- Prefer a separate station module, for example src/stations/bulk-input.ts, rather than bloating src/index.ts.
+- Keep routing explicit and auditable.
+- Add a new numbered migration; do not edit already-applied migrations.
+- No JavaScript is needed on the experiment page.
+- No form controls are needed.
+- No POST endpoint is needed for the experiment.
+- No cookies or client-side state.
+- No authentication system.
+- No browser automation.
+- No external search API integration.
+- No provider-specific search code.
+- No attempt to manufacture the payload into a Parcours URL.
+- No referrer parsing or provider fingerprinting.
+- No Loom integration.
+- Do not modify the scientific semantics of the existing three binary stations.
 
-# Required automated tests
+## Quality checks
 
-Preserve all existing Static Binary Channel tests.
+Before finishing, run:
 
-Add tests for at least the following.
+~~~sh
+npm run typecheck
+npm test
+git diff --check
+~~~
 
-## Circular Trail
+Fix all failures.
 
-1. Creating a trail run yields empty bits and `created` state.
-2. Pre-arm trail action does not mutate state and is logged.
-3. Arming enables writes.
-4. First ZERO page appends `0` exactly once.
-5. First ONE page appends `1` exactly once.
-6. A successful action response contains ordinary ZERO, ONE, and READ links for the next step.
-7. The next-step links have fresh concrete URLs distinct from the just-used URLs.
-8. Following a sequence such as `01010101` through successive server-issued links yields exactly `01010101`.
-9. Replaying an already-used trail action URL does not append again.
-10. Replay behavior is logged distinctly.
-11. READ returns authoritative bits and records observed length.
-12. Unknown/expired trail runs behave deterministically.
-13. Trail endpoints send cache-prevention headers.
-14. Trail operation does not depend on cookies.
+Ensure the new migration is additive and safe for an already-deployed D1 database.
 
-## URL Alias / Suffix
+## Final implementation report
 
-1. Creating an alias run yields empty bits and `created` state.
-2. Pre-arm alias action does not mutate state.
-3. After arming, `/0/a`, `/0/b`, `/0/c` append `000`.
-4. After arming, `/1/a`, `/1/b`, `/1/c` append `111`.
-5. Reusing the same alias path does not append twice if single-use semantics are chosen.
-6. Different suffixes for the same logical action are treated as distinct fresh actions.
-7. Mixed aliases produce the expected bit order.
-8. READ does not mutate state.
-9. Unknown/expired runs behave deterministically.
-10. Alias endpoints send cache-prevention headers.
-11. Alias operation does not depend on cookies.
+At the end, report concisely:
 
-## SQL / integration coverage
-
-Use the existing SQLite-backed D1-compatible integration approach where useful, but describe it accurately as SQLite integration for D1-compatible SQL rather than real Cloudflare D1.
-
-Add integration coverage for:
-
-- transactional write + telemetry behavior;
-- single-use replay prevention;
-- trail step advancement;
-- rollback if telemetry insertion fails.
-
-Do not overstate local adapter tests as proof of Cloudflare runtime behavior.
-
----
-
-# Suggested manual experimental matrix
-
-Document a small manual matrix using fresh runs.
-
-## Static baseline
-
-```text
-1
-101
-00000
-01010101
-```
-
-## Circular Trail
-
-```text
-1
-101
-00000
-01010101
-01000001
-```
-
-The tested agent should receive only the trail entry URL plus the instruction to use the links each page presents.
-
-## Alias, explicit/verbatim
-
-Provide enough explicit aliases to transmit:
-
-```text
-00000
-11111
-01010101
-```
-
-## Alias, template-derived negative control
-
-Provide a base/template rule and ask the model to derive `a`, `b`, `c`, etc.
-
-Record whether it understands the template separately from whether the browser actually navigates to the constructed URLs.
-
----
-
-# Non-goals for this Codex run
-
-Do NOT add:
-
-- generic button/radio/text-input/form stations;
-- React or another frontend framework;
-- browser automation;
-- Selenium/Playwright as product behavior;
-- provider-specific code;
-- model detection;
-- automatic prompt execution;
-- account/login system;
-- Loom integration;
-- agent auth tokens;
-- MCP/WebMCP;
-- analytics products;
-- decorative UI work;
-- generalized benchmark scoring;
-- speculative provider-policy logic.
-
-Do not remove or silently change the existing Static Binary Channel's scientific meaning.
-
----
-
-# Quality requirements
-
-Before finishing:
-
-1. Inspect the current repository before editing; work with the existing implementation rather than regenerating it from scratch.
-2. Preserve all current working Static Binary Channel behavior and tests.
-3. Run TypeScript typecheck.
-4. Run the full automated test suite.
-5. Fix all typecheck/test failures.
-6. Ensure schema migrations are additive and safe for an already-deployed D1 database.
-7. Do not edit the original applied migration if a new migration is required; add a numbered migration.
-8. Ensure no Cloudflare secrets or fabricated IDs are committed.
-9. Ensure all state-changing writes and telemetry remain transactionally consistent.
-10. Ensure all replay/single-use semantics are deterministic under concurrent requests.
-11. Ensure every experimental endpoint sends the intended no-cache headers.
-12. Keep implementation small, explicit, and auditable.
-13. Update README and human setup pages sufficiently that the experiment can be deployed and run without rediscovering the protocol.
-
-At the end, provide a concise implementation report containing:
-
-- files added/changed;
+- files changed/added;
 - new routes;
-- migration/schema changes;
-- exact trail semantics;
-- exact alias/suffix semantics;
-- replay behavior;
-- test and typecheck status;
-- any implementation decision that materially deviated from this task and why.
+- migration/schema change;
+- exact values captured and persisted;
+- exact caching/indexability behavior;
+- test and typecheck results;
+- any deviation from this task and why.
 
-Do not broaden scope beyond the Circular Trail, URL Suffix/Alias condition, and the small Static Binary Channel usability fixes described above.
+Do not broaden the slice beyond the parcours_bulk_input search-referrer experiment.
