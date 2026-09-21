@@ -1,5 +1,7 @@
 # LLM Parcours
 
+**Live site:** https://llm-parcours.metasemantix.workers.dev/
+
 LLM Parcours is a neutral experimental site for testing concrete web-interaction primitives available to deployed LLM agent environments. It measures deployed interaction affordances—not model intelligence in the abstract. Understanding an interface, perceiving and selecting an action, executing it, continuing after state changes, and creating or retrieving persistent state are recorded as separate observations.
 
 ## Experimental discipline
