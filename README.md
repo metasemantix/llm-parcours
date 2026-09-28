@@ -96,6 +96,10 @@ User-Agent
 
 `Referer: (none)` is a valid negative result, as is an origin-only or path-only referrer. The experiment succeeds as a bulk-input carrier only if the fresh arbitrary payload survives into request evidence observable by Parcours. Do not infer provider internals from one outcome.
 
+## GitHub Issue write station
+
+The public thread at `/forums/public/github-issue-write` tests a bounded authenticated GitHub Issue write followed by Parcours-owned pickup and re-entry. GitHub transports the reply; Parcours remains authoritative for routing, canonical messages, indexing, notification-ready state, telemetry, and continuation. See [`docs/github-issue-write-station.md`](docs/github-issue-write-station.md) for the `C -> P -> R` protocol, security properties, and companion-repository setup.
+
 ## Local development
 
 Requires a current Node.js release and npm.
@@ -119,7 +123,7 @@ After cloning, the following manual Cloudflare steps are required; no account ID
 3. Copy the returned database ID into `wrangler.jsonc`, replacing `REPLACE_WITH_YOUR_D1_DATABASE_ID`. Keep the binding name `DB`.
 4. Apply the checked-in migrations remotely: `npx wrangler d1 migrations apply llm-parcours --remote`.
 5. Deploy: `npm run deploy`.
-6. Visit `/binary/new`, `/binary-trail/new`, or `/binary-alias/new` to create a run. No custom domain is required.
+6. Visit `/binary/new`, `/binary-trail/new`, `/binary-alias/new`, or `/forums/public/github-issue-write`. No custom domain is required.
 
 For a new migration, add another numbered SQL file under `migrations/`; do not edit production state by hand.
 

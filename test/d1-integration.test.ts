@@ -31,6 +31,7 @@ class SQLiteD1 implements D1Database {
     this.database.exec(readFileSync(new URL("../migrations/0001_initial.sql", import.meta.url), "utf8"));
     this.database.exec(readFileSync(new URL("../migrations/0002_trail_alias.sql", import.meta.url), "utf8"));
     this.database.exec(readFileSync(new URL("../migrations/0003_bulk_input_observations.sql", import.meta.url), "utf8"));
+    this.database.exec(readFileSync(new URL("../migrations/0004_github_issue_write.sql", import.meta.url), "utf8"));
   }
   prepare(sql: string) { return new SQLiteStatement(this.database, sql); }
   async batch<T>(statements: D1PreparedStatement[]): Promise<D1Result<T>[]> {
@@ -51,6 +52,89 @@ class SQLiteD1 implements D1Database {
 }
 
 describe("SQLite integration for D1-compatible SQL", () => {
+  it("implements the hashed, single-use C -> P -> R GitHub Issue journey", async () => {
+    const sqlite = new SQLiteD1(); const env: Env = { DB: sqlite, CAPABILITY_ENCRYPTION_KEY: "K".repeat(43) };
+    const call = (path: string, init?: RequestInit) => worker.fetch(new Request(`https://integration.test${path}`, init), env);
+    const replyPage = await (await call("/forums/public/github-issue-write/reply")).text();
+    const targetHref = replyPage.match(/href="(https:\/\/github\.com\/metasemantix\/parcours-issue-write\/issues\/new\?[^\"]+)"/)?.[1]?.replaceAll("&amp;", "&");
+    assert.ok(targetHref);
+    const target = new URL(targetHref);
+    const issueBody = target.searchParams.get("body"); assert.ok(issueBody);
+    const capability = issueBody.match(/parcours-write-capability: ([A-Za-z0-9_-]{43})/)?.[1]; assert.ok(capability);
+    assert.equal(replyPage.includes(sqlite.database.prepare("SELECT id FROM activity_chains").get()?.id as string), false);
+    const write = sqlite.database.prepare("SELECT * FROM write_capabilities").get();
+    assert.equal(write?.token_hash === capability, false);
+    assert.equal(write?.scope, "append_reply");
+    assert.equal(write?.thread_id, "thread_github_write");
+    assert.ok(String(write?.expires_at) > String(write?.issued_at));
+    const payload = {
+      capability, issue_number: 42,
+      issue_url: "https://github.com/metasemantix/parcours-issue-write/issues/42",
+      issue_actor: "agent-test", title: "$(touch /tmp/nope)<script>alert(1)</script>",
+      body: issueBody.replace("Replace this line with your reply while preserving the capability marker above.", "Hostile <script>alert(1)</script> `$(touch /tmp/nope)` reply"),
+      forum: "attacker", thread: "wrong",
+    };
+    const accepted = await call("/api/github-issue-write/ingest", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) });
+    assert.equal(accepted.status, 201);
+    const result = await accepted.json() as { pickup_url: string; message_url: string };
+    assert.match(result.pickup_url, /^https:\/\/integration\.test\/github-write\/pickup\/[A-Za-z0-9_-]{43}$/);
+    assert.equal(sqlite.database.prepare("SELECT COUNT(*) n FROM messages WHERE source = 'github_issue'").get()?.n, 1);
+    const message = sqlite.database.prepare("SELECT * FROM messages WHERE source = 'github_issue'").get();
+    assert.equal(message?.thread_id, "thread_github_write");
+    assert.equal(message?.source_issue_number, 42);
+    assert.equal(message?.source_actor, "agent-test");
+    assert.equal(sqlite.database.prepare("SELECT COUNT(*) n FROM thread_notifications").get()?.n, 1);
+    assert.equal(sqlite.database.prepare("SELECT consumed_at IS NOT NULL used FROM write_capabilities").get()?.used, 1);
+    assert.equal(sqlite.database.prepare("SELECT token_hash FROM pickup_capabilities").get()?.token_hash === result.pickup_url.split("/").at(-1), false);
+    assert.equal(sqlite.database.prepare("SELECT token_ciphertext FROM pickup_capabilities").get()?.token_ciphertext === result.pickup_url.split("/").at(-1), false);
+    assert.equal(result.pickup_url.split("/").at(-1) === capability, false);
+    const publicThread = await (await call("/forums/public/github-issue-write")).text();
+    assert.match(publicThread, /Hostile &lt;script&gt;alert\(1\)&lt;\/script&gt;/);
+    assert.equal(publicThread.includes("<script>alert(1)</script>"), false);
+    assert.equal(publicThread.includes(capability), false);
+    const replay = await call("/api/github-issue-write/ingest", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) });
+    assert.equal(replay.status, 200);
+    const replayResult = await replay.json() as { idempotent: boolean; pickup_url: string };
+    assert.equal(replayResult.idempotent, true);
+    assert.equal(replayResult.pickup_url, result.pickup_url);
+    assert.equal(sqlite.database.prepare("SELECT COUNT(*) n FROM messages WHERE source = 'github_issue'").get()?.n, 1);
+    const pickupPath = new URL(result.pickup_url).pathname;
+    const pickupResponse = await call(pickupPath); assert.equal(pickupResponse.status, 200);
+    const pickupHtml = await pickupResponse.text();
+    const reentryPath = pickupHtml.match(/href="https:\/\/integration\.test(\/reenter\/[A-Za-z0-9_-]{43})"/)?.[1]; assert.ok(reentryPath);
+    assert.equal((await call(pickupPath)).status, 409);
+    assert.equal(sqlite.database.prepare("SELECT token_ciphertext IS NULL erased FROM pickup_capabilities").get()?.erased, 1);
+    const postPickupReplay = await call("/api/github-issue-write/ingest", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) });
+    const postPickupResult = await postPickupReplay.json() as { pickup_state: string; pickup_url?: string };
+    assert.equal(postPickupResult.pickup_state, "already_redeemed");
+    assert.equal(postPickupResult.pickup_url, undefined);
+    assert.equal(sqlite.database.prepare("SELECT COUNT(*) n FROM reentry_capabilities").get()?.n, 1);
+    const resumed = await call(reentryPath); assert.equal(resumed.status, 200); assert.match(await resumed.text(), /latest completed operation/);
+    assert.equal((await call(reentryPath)).status, 409);
+    const chains = sqlite.database.prepare("SELECT DISTINCT chain_id FROM activity_events").all(); assert.equal(chains.length, 1);
+    const events = sqlite.database.prepare("SELECT event_type, metadata_json FROM activity_events ORDER BY id").all();
+    for (const expected of ["reply_affordance_opened", "write_capability_issued", "departure_toward_github", "github_capability_redeemed", "canonical_message_created", "pickup_capability_issued", "pickup_capability_redeemed", "proper_reentry_issued", "reentry_redeemed", "continuation_reached"]) assert.equal(events.some(event => event.event_type === expected), true);
+    assert.equal(JSON.stringify(events).includes(capability), false);
+    assert.equal(JSON.stringify(events).includes(result.pickup_url.split("/").at(-1)!), false);
+    sqlite.database.close();
+  });
+
+  it("rejects malformed, unknown, expired, and conflicting spent capabilities without posts", async () => {
+    const sqlite = new SQLiteD1(); const env: Env = { DB: sqlite, CAPABILITY_ENCRYPTION_KEY: "K".repeat(43) };
+    const call = (path: string, payload: unknown) => worker.fetch(new Request(`https://integration.test${path}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) }), env);
+    assert.equal((await call("/api/github-issue-write/ingest", { capability: "bad" })).status, 400);
+    const unknown = "A".repeat(43);
+    assert.equal((await call("/api/github-issue-write/ingest", { capability: unknown, issue_number: 1, issue_url: "https://github.com/metasemantix/parcours-issue-write/issues/1", issue_actor: "actor", title: "x", body: `<!-- parcours-write-capability: ${unknown} -->\n\n## Reply\nhello` })).status, 404);
+    const issuance = await worker.fetch(new Request("https://integration.test/forums/public/github-issue-write/reply"), env);
+    const target = new URL(issuance.ok ? (await issuance.text()).match(/href="(https:\/\/github\.com[^\"]+)/)![1]!.replaceAll("&amp;", "&") : "");
+    const body = target.searchParams.get("body")!;
+    const capability = body.match(/parcours-write-capability: ([A-Za-z0-9_-]{43})/)![1]!;
+    sqlite.database.prepare("UPDATE write_capabilities SET expires_at = '2000-01-01'").run();
+    const expiredPayload = { capability, issue_number: 2, issue_url: "https://github.com/metasemantix/parcours-issue-write/issues/2", issue_actor: "actor", title: "x", body: body.replace("Replace this line with your reply while preserving the capability marker above.", "hello") };
+    assert.equal((await call("/api/github-issue-write/ingest", expiredPayload)).status, 410);
+    assert.equal(sqlite.database.prepare("SELECT COUNT(*) n FROM messages WHERE source = 'github_issue'").get()?.n, 0);
+    sqlite.database.close();
+  });
   it("persists the exact bulk-input request evidence rendered by the Worker", async () => {
     const sqlite = new SQLiteD1();
     const referrer = "https://search.example/?q=parcours_bulk_input+nonce-7q41&x=<raw>";
