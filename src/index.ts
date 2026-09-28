@@ -1,6 +1,7 @@
 import { handleBinaryRequest } from "./stations/binary-static.ts";
 import { handleDynamicRequest } from "./stations/binary-dynamic.ts";
 import { handleBulkInputRequest, robotsResponse, sitemapResponse } from "./stations/bulk-input.ts";
+import { forumView, ingestIssue, issueReplyTarget, pickup, reenter, threadView } from "./stations/github-issue-write.ts";
 
 export interface Env {
   DB: D1Database;
@@ -17,6 +18,7 @@ export default {
       if (request.method === "POST" && /^\/binary\/[^/]+\/arm$/.test(url.pathname)) {
         return await handleBinaryRequest(request, env);
       }
+      if (request.method === "POST" && url.pathname === "/api/github-issue-write/ingest") return await ingestIssue(request, env);
       if (url.pathname.startsWith("/binary-trail/")) return await handleDynamicRequest(request, env, "trail");
       if (url.pathname.startsWith("/binary-alias/")) return await handleDynamicRequest(request, env, "alias");
       if (request.method !== "GET") return notFound();
@@ -26,11 +28,18 @@ export default {
         });
       }
       if (url.pathname === "/experiments/parcours_bulk_input") return await handleBulkInputRequest(request, env);
+      if (url.pathname === "/forums/public") return await forumView();
+      if (url.pathname === "/forums/public/github-issue-write") return await threadView(request, env);
+      if (url.pathname === "/forums/public/github-issue-write/reply") return await issueReplyTarget(request, env);
+      const pickupMatch = url.pathname.match(/^\/github-write\/pickup\/([^/]+)$/);
+      if (pickupMatch) return await pickup(pickupMatch[1]!, request, env);
+      const reentryMatch = url.pathname.match(/^\/reenter\/([^/]+)$/);
+      if (reentryMatch) return await reenter(reentryMatch[1]!, env);
       if (url.pathname === "/robots.txt") return robotsResponse(request);
       if (url.pathname === "/sitemap.xml") return sitemapResponse(request);
       if (url.pathname === "/") {
         return new Response(
-          "<!doctype html><html><head><meta charset=\"utf-8\"><title>LLM Parcours</title></head><body><main><h1>LLM Parcours</h1><p>Experiments testing concrete web-interaction primitives available to deployed LLM agent environments.</p><ul><li><a href=\"/binary/new\">Static Binary Channel</a></li><li><a href=\"/binary-trail/new\">Circular Trail</a></li><li><a href=\"/binary-alias/new\">URL Suffix / Alias Channel</a></li><li><a href=\"/experiments/parcours_bulk_input\">parcours_bulk_input search-referrer probe</a></li></ul></main></body></html>",
+          "<!doctype html><html><head><meta charset=\"utf-8\"><title>LLM Parcours</title></head><body><main><h1>LLM Parcours</h1><p>Experiments testing concrete web-interaction primitives available to deployed LLM agent environments.</p><ul><li><a href=\"/binary/new\">Static Binary Channel</a></li><li><a href=\"/binary-trail/new\">Circular Trail</a></li><li><a href=\"/binary-alias/new\">URL Suffix / Alias Channel</a></li><li><a href=\"/experiments/parcours_bulk_input\">parcours_bulk_input search-referrer probe</a></li><li><a href=\"/forums/public/github-issue-write\">GitHub Issue write experiment</a></li></ul></main></body></html>",
           { headers: { "Content-Type": "text/html; charset=utf-8" } },
         );
       }

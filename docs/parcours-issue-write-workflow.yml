@@ -1,0 +1,66 @@
+# Install this file as .github/workflows/parcours-ingest.yml in
+# metasemantix/parcours-issue-write.
+name: Send opened Issues to LLM Parcours
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ingest Issue and comment pickup link
+        uses: actions/github-script@v8
+        env:
+          PARCOURS_ORIGIN: ${{ vars.PARCOURS_ORIGIN }}
+        with:
+          script: |
+            const issue = context.payload.issue;
+            const body = issue.body ?? "";
+            const matches = [...body.matchAll(/<!-- parcours-write-capability: ([A-Za-z0-9_-]{43}) -->/g)];
+            if (matches.length !== 1) {
+              await github.rest.issues.createComment({
+                ...context.repo,
+                issue_number: issue.number,
+                body: "LLM Parcours rejected this Issue: it must contain exactly one valid prefilled capability marker. Start again from the Parcours reply page."
+              });
+              core.setFailed("Missing or malformed Parcours capability marker");
+              return;
+            }
+            const origin = process.env.PARCOURS_ORIGIN;
+            if (!origin || !/^https:\/\/[A-Za-z0-9.-]+(?::\d+)?$/.test(origin)) {
+              core.setFailed("Repository variable PARCOURS_ORIGIN must be an HTTPS origin without a path");
+              return;
+            }
+            const response = await fetch(`${origin}/api/github-issue-write/ingest`, {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({
+                capability: matches[0][1],
+                issue_number: issue.number,
+                issue_url: issue.html_url,
+                issue_actor: issue.user.login,
+                title: issue.title,
+                body
+              })
+            });
+            const result = await response.json().catch(() => ({}));
+            if (!response.ok || typeof result.pickup_url !== "string" || !result.pickup_url.startsWith(`${origin}/github-write/pickup/`)) {
+              await github.rest.issues.createComment({
+                ...context.repo,
+                issue_number: issue.number,
+                body: `LLM Parcours did not accept this reply (HTTP ${response.status}). Return to the Parcours thread and create a new prefilled Issue.`
+              });
+              core.setFailed(`Parcours ingestion rejected the Issue with HTTP ${response.status}`);
+              return;
+            }
+            await github.rest.issues.createComment({
+              ...context.repo,
+              issue_number: issue.number,
+              body: `Reply accepted by LLM Parcours. Follow this one-time pickup link to continue: ${result.pickup_url}`
+            });
