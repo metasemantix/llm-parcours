@@ -53,7 +53,7 @@ class SQLiteD1 implements D1Database {
 
 describe("SQLite integration for D1-compatible SQL", () => {
   it("implements the hashed, single-use C -> P -> R GitHub Issue journey", async () => {
-    const sqlite = new SQLiteD1(); const env: Env = { DB: sqlite };
+    const sqlite = new SQLiteD1(); const env: Env = { DB: sqlite, CAPABILITY_ENCRYPTION_KEY: "K".repeat(43) };
     const call = (path: string, init?: RequestInit) => worker.fetch(new Request(`https://integration.test${path}`, init), env);
     const replyPage = await (await call("/forums/public/github-issue-write/reply")).text();
     const targetHref = replyPage.match(/href="(https:\/\/github\.com\/metasemantix\/parcours-issue-write\/issues\/new\?[^\"]+)"/)?.[1]?.replaceAll("&amp;", "&");
@@ -86,19 +86,28 @@ describe("SQLite integration for D1-compatible SQL", () => {
     assert.equal(sqlite.database.prepare("SELECT COUNT(*) n FROM thread_notifications").get()?.n, 1);
     assert.equal(sqlite.database.prepare("SELECT consumed_at IS NOT NULL used FROM write_capabilities").get()?.used, 1);
     assert.equal(sqlite.database.prepare("SELECT token_hash FROM pickup_capabilities").get()?.token_hash === result.pickup_url.split("/").at(-1), false);
+    assert.equal(sqlite.database.prepare("SELECT token_ciphertext FROM pickup_capabilities").get()?.token_ciphertext === result.pickup_url.split("/").at(-1), false);
+    assert.equal(result.pickup_url.split("/").at(-1) === capability, false);
     const publicThread = await (await call("/forums/public/github-issue-write")).text();
     assert.match(publicThread, /Hostile &lt;script&gt;alert\(1\)&lt;\/script&gt;/);
     assert.equal(publicThread.includes("<script>alert(1)</script>"), false);
     assert.equal(publicThread.includes(capability), false);
     const replay = await call("/api/github-issue-write/ingest", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) });
     assert.equal(replay.status, 200);
-    assert.equal((await replay.json() as { idempotent: boolean }).idempotent, true);
+    const replayResult = await replay.json() as { idempotent: boolean; pickup_url: string };
+    assert.equal(replayResult.idempotent, true);
+    assert.equal(replayResult.pickup_url, result.pickup_url);
     assert.equal(sqlite.database.prepare("SELECT COUNT(*) n FROM messages WHERE source = 'github_issue'").get()?.n, 1);
     const pickupPath = new URL(result.pickup_url).pathname;
     const pickupResponse = await call(pickupPath); assert.equal(pickupResponse.status, 200);
     const pickupHtml = await pickupResponse.text();
     const reentryPath = pickupHtml.match(/href="https:\/\/integration\.test(\/reenter\/[A-Za-z0-9_-]{43})"/)?.[1]; assert.ok(reentryPath);
     assert.equal((await call(pickupPath)).status, 409);
+    assert.equal(sqlite.database.prepare("SELECT token_ciphertext IS NULL erased FROM pickup_capabilities").get()?.erased, 1);
+    const postPickupReplay = await call("/api/github-issue-write/ingest", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) });
+    const postPickupResult = await postPickupReplay.json() as { pickup_state: string; pickup_url?: string };
+    assert.equal(postPickupResult.pickup_state, "already_redeemed");
+    assert.equal(postPickupResult.pickup_url, undefined);
     assert.equal(sqlite.database.prepare("SELECT COUNT(*) n FROM reentry_capabilities").get()?.n, 1);
     const resumed = await call(reentryPath); assert.equal(resumed.status, 200); assert.match(await resumed.text(), /latest completed operation/);
     assert.equal((await call(reentryPath)).status, 409);
@@ -111,7 +120,7 @@ describe("SQLite integration for D1-compatible SQL", () => {
   });
 
   it("rejects malformed, unknown, expired, and conflicting spent capabilities without posts", async () => {
-    const sqlite = new SQLiteD1(); const env: Env = { DB: sqlite };
+    const sqlite = new SQLiteD1(); const env: Env = { DB: sqlite, CAPABILITY_ENCRYPTION_KEY: "K".repeat(43) };
     const call = (path: string, payload: unknown) => worker.fetch(new Request(`https://integration.test${path}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) }), env);
     assert.equal((await call("/api/github-issue-write/ingest", { capability: "bad" })).status, 400);
     const unknown = "A".repeat(43);

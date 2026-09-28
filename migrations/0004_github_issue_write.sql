@@ -73,6 +73,8 @@ CREATE TABLE write_capabilities (
 
 CREATE TABLE pickup_capabilities (
   token_hash TEXT PRIMARY KEY,
+  token_ciphertext TEXT,
+  token_nonce TEXT,
   chain_id TEXT NOT NULL,
   message_id TEXT NOT NULL,
   issued_at TEXT NOT NULL,

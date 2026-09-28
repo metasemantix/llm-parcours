@@ -50,6 +50,14 @@ jobs:
               })
             });
             const result = await response.json().catch(() => ({}));
+            if (response.ok && result.status === "accepted" && result.pickup_state === "already_redeemed") {
+              await github.rest.issues.createComment({
+                ...context.repo,
+                issue_number: issue.number,
+                body: "Reply already accepted by LLM Parcours; its one-time pickup link has already been redeemed."
+              });
+              return;
+            }
             if (!response.ok || typeof result.pickup_url !== "string" || !result.pickup_url.startsWith(`${origin}/github-write/pickup/`)) {
               await github.rest.issues.createComment({
                 ...context.repo,

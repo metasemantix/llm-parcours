@@ -2,7 +2,7 @@ import type { Env } from "../index.ts";
 
 export const WRITE_TTL_SECONDS = 30 * 60;
 export const PICKUP_TTL_SECONDS = 10 * 60;
-export const REENTRY_TTL_SECONDS = 10 * 60;
+export const REENTRY_TTL_SECONDS = 60 * 60;
 export const MAX_REPLY_LENGTH = 8_000;
 const TOKEN_PATTERN = /^[A-Za-z0-9_-]{43}$/;
 const EXPECTED_ISSUE_PREFIX = "https://github.com/metasemantix/parcours-issue-write/issues/";
@@ -10,6 +10,7 @@ const NO_CACHE = { "Cache-Control": "no-store, no-cache, must-revalidate", Pragm
 
 type WriteRow = { token_hash: string; chain_id: string; forum_id: string; thread_id: string; parent_message_id: string | null; scope: string; expires_at: string; consumed_at: string | null; result_message_id: string | null; issue_number: number | null; issue_url: string | null };
 type PickupRow = { chain_id: string; message_id: string; expires_at: string; consumed_at: string | null };
+type RetryPickupRow = { token_ciphertext: string | null; token_nonce: string | null; consumed_at: string | null };
 
 const enc = new TextEncoder();
 const randomToken = () => base64url(crypto.getRandomValues(new Uint8Array(32)));
@@ -20,7 +21,24 @@ const base64url = (bytes: Uint8Array) => {
   return btoa(value).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 };
 const hash = async (value: string) => base64url(new Uint8Array(await crypto.subtle.digest("SHA-256", enc.encode(value))));
-const derivedPickup = async (capability: string) => hash(`parcours-pickup-v1:${capability}`);
+const fromBase64url = (value: string) => {
+  const padded = value.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((value.length + 3) % 4);
+  return Uint8Array.from(atob(padded), char => char.charCodeAt(0));
+};
+async function encryptionKey(env: Env): Promise<CryptoKey> {
+  if (!env.CAPABILITY_ENCRYPTION_KEY || !TOKEN_PATTERN.test(env.CAPABILITY_ENCRYPTION_KEY)) throw new Error("capability_encryption_key_not_configured");
+  return crypto.subtle.importKey("raw", fromBase64url(env.CAPABILITY_ENCRYPTION_KEY), "AES-GCM", false, ["encrypt", "decrypt"]);
+}
+async function encryptPickup(token: string, messageId: string, env: Env): Promise<{ ciphertext: string; nonce: string }> {
+  const nonce = crypto.getRandomValues(new Uint8Array(12));
+  const ciphertext = await crypto.subtle.encrypt({ name: "AES-GCM", iv: nonce, additionalData: enc.encode(messageId) }, await encryptionKey(env), enc.encode(token));
+  return { ciphertext: base64url(new Uint8Array(ciphertext)), nonce: base64url(nonce) };
+}
+async function decryptPickup(row: RetryPickupRow, messageId: string, env: Env): Promise<string | null> {
+  if (!row.token_ciphertext || !row.token_nonce || row.consumed_at) return null;
+  const plaintext = await crypto.subtle.decrypt({ name: "AES-GCM", iv: fromBase64url(row.token_nonce), additionalData: enc.encode(messageId) }, await encryptionKey(env), fromBase64url(row.token_ciphertext));
+  return new TextDecoder().decode(plaintext);
+}
 const isoAfter = (seconds: number) => new Date(Date.now() + seconds * 1000).toISOString();
 const html = (value: unknown) => String(value).replace(/[&<>"']/g, char => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]!);
 const page = (title: string, content: string, status = 200) => new Response(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>${html(title)}</title></head><body><main>${content}</main></body></html>`, { status, headers: { "Content-Type": "text/html; charset=utf-8", ...NO_CACHE } });
@@ -84,10 +102,12 @@ export async function ingestIssue(request: Request, env: Env): Promise<Response>
   const existing = await env.DB.prepare("SELECT token_hash, chain_id, forum_id, thread_id, parent_message_id, scope, expires_at, consumed_at, result_message_id, issue_number, issue_url FROM write_capabilities WHERE token_hash = ?").bind(capabilityHash).first<WriteRow>();
   if (!existing) return json({ error: "unknown_capability" }, 404);
   const origin = new URL(request.url).origin;
-  const pickup = await derivedPickup(capability);
-  const pickupHash = await hash(pickup);
   if (existing.consumed_at) {
-    if (existing.issue_number === issueNumber && existing.issue_url === issueUrl) return json({ status: "accepted", idempotent: true, message_url: `${origin}/forums/public/github-issue-write#${existing.result_message_id}`, pickup_url: `${origin}/github-write/pickup/${pickup}` });
+    if (existing.issue_number === issueNumber && existing.issue_url === issueUrl && existing.result_message_id) {
+      const saved = await env.DB.prepare("SELECT token_ciphertext, token_nonce, consumed_at FROM pickup_capabilities WHERE message_id = ?").bind(existing.result_message_id).first<RetryPickupRow>();
+      const pickup = saved ? await decryptPickup(saved, existing.result_message_id, env) : null;
+      return json({ status: "accepted", idempotent: true, message_url: `${origin}/forums/public/github-issue-write#${existing.result_message_id}`, ...(pickup ? { pickup_url: `${origin}/github-write/pickup/${pickup}` } : { pickup_state: "already_redeemed" }) });
+    }
     return json({ error: "capability_spent" }, 409);
   }
   const now = new Date().toISOString();
@@ -95,22 +115,37 @@ export async function ingestIssue(request: Request, env: Env): Promise<Response>
   if (existing.scope !== "append_reply") return json({ error: "invalid_scope" }, 403);
   const messageId = randomId("message");
   const notificationId = randomId("notification");
+  const pickup = randomToken();
+  const pickupHash = await hash(pickup);
+  const encryptedPickup = await encryptPickup(pickup, messageId, env);
   try {
     await env.DB.batch([
       env.DB.prepare("UPDATE write_capabilities SET consumed_at = ?, result_message_id = ?, issue_number = ?, issue_url = ?, issue_actor = ? WHERE token_hash = ? AND consumed_at IS NULL AND expires_at > ? AND scope = 'append_reply'").bind(now, messageId, issueNumber, issueUrl, actor, capabilityHash, now),
       env.DB.prepare("INSERT OR IGNORE INTO messages (id, thread_id, parent_message_id, body, source, source_issue_number, source_issue_url, source_actor, created_at) SELECT ?, thread_id, parent_message_id, ?, 'github_issue', ?, ?, ?, ? FROM write_capabilities WHERE token_hash = ? AND result_message_id = ?").bind(messageId, reply, issueNumber, issueUrl, actor, now, capabilityHash, messageId),
-      env.DB.prepare("INSERT OR IGNORE INTO pickup_capabilities (token_hash, chain_id, message_id, issued_at, expires_at) SELECT ?, chain_id, result_message_id, ?, ? FROM write_capabilities WHERE token_hash = ? AND result_message_id = ?").bind(pickupHash, now, isoAfter(PICKUP_TTL_SECONDS), capabilityHash, messageId),
+      env.DB.prepare("INSERT OR IGNORE INTO pickup_capabilities (token_hash, token_ciphertext, token_nonce, chain_id, message_id, issued_at, expires_at) SELECT ?, ?, ?, chain_id, result_message_id, ?, ? FROM write_capabilities WHERE token_hash = ? AND result_message_id = ?").bind(pickupHash, encryptedPickup.ciphertext, encryptedPickup.nonce, now, isoAfter(PICKUP_TTL_SECONDS), capabilityHash, messageId),
       env.DB.prepare("INSERT OR IGNORE INTO thread_notifications (id, thread_id, message_id, event_type, created_at) SELECT ?, thread_id, result_message_id, 'new_reply', ? FROM write_capabilities WHERE token_hash = ? AND result_message_id = ?").bind(notificationId, now, capabilityHash, messageId),
       ...["github_capability_redeemed", "canonical_message_created", "pickup_capability_issued"].map(event => env.DB.prepare("INSERT INTO activity_events (chain_id, event_type, message_id, metadata_json, created_at) SELECT chain_id, ?, result_message_id, ?, ? FROM write_capabilities WHERE token_hash = ? AND result_message_id = ?").bind(event, event === "github_capability_redeemed" ? JSON.stringify({ issue_number: issueNumber, issue_url: issueUrl, issue_actor: actor }) : null, now, capabilityHash, messageId)),
       env.DB.prepare("UPDATE activity_chains SET updated_at = ? WHERE id = ?").bind(now, existing.chain_id),
     ]);
   } catch {
     const accepted = await env.DB.prepare("SELECT result_message_id, issue_number, issue_url FROM write_capabilities WHERE token_hash = ? AND consumed_at IS NOT NULL").bind(capabilityHash).first<{ result_message_id: string; issue_number: number; issue_url: string }>();
-    if (accepted && accepted.issue_number === issueNumber && accepted.issue_url === issueUrl) return json({ status: "accepted", idempotent: true, message_url: `${origin}/forums/public/github-issue-write#${accepted.result_message_id}`, pickup_url: `${origin}/github-write/pickup/${pickup}` });
+    if (accepted && accepted.issue_number === issueNumber && accepted.issue_url === issueUrl) {
+      const saved = await env.DB.prepare("SELECT token_ciphertext, token_nonce, consumed_at FROM pickup_capabilities WHERE message_id = ?").bind(accepted.result_message_id).first<RetryPickupRow>();
+      const recovered = saved ? await decryptPickup(saved, accepted.result_message_id, env) : null;
+      return json({ status: "accepted", idempotent: true, message_url: `${origin}/forums/public/github-issue-write#${accepted.result_message_id}`, ...(recovered ? { pickup_url: `${origin}/github-write/pickup/${recovered}` } : { pickup_state: "already_redeemed" }) });
+    }
     throw new Error("ingestion_transaction_failed");
   }
   const accepted = await env.DB.prepare("SELECT result_message_id FROM write_capabilities WHERE token_hash = ? AND result_message_id = ?").bind(capabilityHash, messageId).first<{ result_message_id: string }>();
-  if (!accepted) return json({ error: "capability_spent" }, 409);
+  if (!accepted) {
+    const winner = await env.DB.prepare("SELECT result_message_id, issue_number, issue_url FROM write_capabilities WHERE token_hash = ? AND consumed_at IS NOT NULL").bind(capabilityHash).first<{ result_message_id: string; issue_number: number; issue_url: string }>();
+    if (winner && winner.issue_number === issueNumber && winner.issue_url === issueUrl) {
+      const saved = await env.DB.prepare("SELECT token_ciphertext, token_nonce, consumed_at FROM pickup_capabilities WHERE message_id = ?").bind(winner.result_message_id).first<RetryPickupRow>();
+      const recovered = saved ? await decryptPickup(saved, winner.result_message_id, env) : null;
+      return json({ status: "accepted", idempotent: true, message_url: `${origin}/forums/public/github-issue-write#${winner.result_message_id}`, ...(recovered ? { pickup_url: `${origin}/github-write/pickup/${recovered}` } : { pickup_state: "already_redeemed" }) });
+    }
+    return json({ error: "capability_spent" }, 409);
+  }
   return json({ status: "accepted", idempotent: false, message_url: `${origin}/forums/public/github-issue-write#${messageId}`, pickup_url: `${origin}/github-write/pickup/${pickup}` }, 201);
 }
 
@@ -126,7 +161,7 @@ export async function pickup(token: string, request: Request, env: Env): Promise
   const reentryHash = await hash(reentry);
   const redemptionId = randomId("redemption");
   await env.DB.batch([
-    env.DB.prepare("UPDATE pickup_capabilities SET consumed_at = ?, redemption_id = ? WHERE token_hash = ? AND consumed_at IS NULL AND expires_at > ?").bind(now, redemptionId, tokenHash, now),
+    env.DB.prepare("UPDATE pickup_capabilities SET consumed_at = ?, redemption_id = ?, token_ciphertext = NULL, token_nonce = NULL WHERE token_hash = ? AND consumed_at IS NULL AND expires_at > ?").bind(now, redemptionId, tokenHash, now),
     env.DB.prepare("INSERT INTO reentry_capabilities (token_hash, chain_id, message_id, issued_at, expires_at) SELECT ?, chain_id, message_id, ?, ? FROM pickup_capabilities WHERE token_hash = ? AND redemption_id = ?").bind(reentryHash, now, isoAfter(REENTRY_TTL_SECONDS), tokenHash, redemptionId),
     env.DB.prepare("INSERT INTO activity_events (chain_id, event_type, message_id, created_at) SELECT chain_id, 'pickup_capability_redeemed', message_id, ? FROM pickup_capabilities WHERE token_hash = ? AND redemption_id = ?").bind(now, tokenHash, redemptionId),
     env.DB.prepare("INSERT INTO activity_events (chain_id, event_type, message_id, created_at) SELECT chain_id, 'proper_reentry_issued', message_id, ? FROM pickup_capabilities WHERE token_hash = ? AND redemption_id = ?").bind(now, tokenHash, redemptionId),

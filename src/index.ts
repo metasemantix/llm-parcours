@@ -5,6 +5,7 @@ import { forumView, ingestIssue, issueReplyTarget, pickup, reenter, threadView }
 
 export interface Env {
   DB: D1Database;
+  CAPABILITY_ENCRYPTION_KEY?: string;
 }
 
 const notFound = () => new Response("not_found\n", { status: 404 });
